@@ -1,5 +1,19 @@
 # DE1302 — No `.to_string()` in Error Conversion Impls
 
+## TL;DR
+
+Calling `.to_string()` on an error inside `impl From<E> for MyErr` (or
+`TryFrom`) collapses a typed source into a string. After that, callers
+can't `.source()` to the cause, can't `.downcast_ref::<E>()` to recover
+the type, and tracing/alerting tools see only the message — not the
+chain. DE1302 fires when the receiver of `.to_string()` is the source
+parameter itself (or a `TryFrom::Error` assoc type that implements
+`Error`). Fix it by storing the source in the variant — usually with
+thiserror's `#[from]` / `#[source]` / `#[error(transparent)]`, or via
+`Box<dyn Error + Send + Sync + 'static>` for opaque buckets. See
+**[Fixing a flagged site](#fixing-a-flagged-site)** for the full
+decision flow.
+
 ## Rule
 
 This lint flags `.to_string()` calls inside `fn from()` (or `fn try_from()`)
@@ -54,6 +68,82 @@ For most conversions, you have better options that preserve the chain:
   and error-reporting libraries need to move errors across tasks.
 - **Match-and-forward**: pattern-match the source variants and map them to
   shape-preserving target variants.
+
+## Fixing a flagged site
+
+When DE1302 fires, work through these in order — the first match is
+almost always the right answer.
+
+1. **Can the target variant hold the source directly (one field, exact
+   type)?** Use thiserror's `#[from]` and delete the manual `From` impl.
+   ```rust
+   #[derive(thiserror::Error, Debug)]
+   enum AppError {
+       #[error("db: {0}")]
+       Database(#[from] DatabaseError),
+   }
+   ```
+
+2. **Is the variant a pure forward (no extra fields, Display delegates)?**
+   Add `#[error(transparent)]` to make it invisible in messages while
+   keeping the chain via `.source()`.
+   ```rust
+   #[derive(thiserror::Error, Debug)]
+   enum AppError {
+       #[error(transparent)]
+       Database(#[from] DatabaseError),
+   }
+   ```
+
+3. **Need a custom variant shape (extra fields like `msg`, `code`,
+   `retry_after`) but still want `.source()` to work?** Use `#[source]`
+   on the source field and write the `From` impl manually.
+   ```rust
+   #[derive(thiserror::Error, Debug)]
+   enum AppError {
+       #[error("db op '{op}' failed: {source}")]
+       Database { op: String, #[source] source: DatabaseError },
+   }
+   ```
+
+4. **One `Internal` bucket that needs to absorb many source types?**
+   Replace `Internal(String)` with
+   `Internal(Box<dyn Error + Send + Sync + 'static>)` and use `.into()`
+   in each From impl — never `.to_string()`.
+   ```rust
+   #[derive(thiserror::Error, Debug)]
+   enum AppError {
+       #[error(transparent)]
+       Internal(Box<dyn std::error::Error + Send + Sync + 'static>),
+   }
+
+   impl From<anyhow::Error> for AppError {
+       fn from(e: anyhow::Error) -> Self { AppError::Internal(e.into()) }
+   }
+   ```
+
+5. **Is the source already an enum whose variants align with the target
+   enum's variants?** Match-and-forward — explicit but preserves shape.
+   ```rust
+   impl From<DbError> for AppError {
+       fn from(e: DbError) -> Self {
+           match e {
+               DbError::NotFound(id) => AppError::NotFound(id),
+               DbError::Conflict(c)  => AppError::Conflict(c),
+               other                 => AppError::Internal(Box::new(other)),
+           }
+       }
+   }
+   ```
+
+6. **None of the above fit** (e.g. an SDK boundary that exposes only an
+   opaque `Internal(String)` and changing the SDK is out of scope).
+   Silence at the impl with a TODO so the debt is grep-able. See
+   **[Configuration](#configuration)** for the exact pattern.
+
+If the answer is "none of these fit because the source isn't actually
+an `Error`-implementing type" — DE1302 won't fire. The receiver-tightening
+gate skips non-Error sources. See `good_from_u32.rs` in the UI tests.
 
 ## Gating
 
@@ -237,8 +327,61 @@ impl From<DatabaseError> for AppError {
 The lint level is **deny** by default. To silence a known site, prefer fixing
 the conversion to preserve the chain. When the underlying error type's shape
 truly forbids that (e.g. an SDK boundary that exposes only opaque
-`Internal(String)`), use a targeted allow with a `TODO(DE1302)` and a brief
-note explaining what the proper fix would require:
+`Internal(String)`), silence the impl explicitly.
+
+### Preferred: `#[expect]` with `reason`
+
+`#[expect(lint, reason = "...")]` (Rust 1.81+) is a stricter form of
+`#[allow]`: if the underlying violation ever stops firing — for example,
+because someone refactors `Internal(String)` into
+`Internal(Box<dyn Error + Send + Sync>)` — the compiler **warns** that the
+expectation didn't fire. The silence ages out automatically as soon as the
+real fix lands.
+
+```rust
+#[expect(
+    unknown_lints,
+    de1302_error_from_to_string,
+    reason = "Internal only carries a String; extend to hold \
+              Box<dyn Error + Send + Sync + 'static> so .source() returns \
+              the original error, then remove this expect."
+)]
+impl From<SomeError> for MyError {
+    fn from(e: SomeError) -> Self {
+        Self::Internal(e.to_string())
+    }
+}
+```
+
+If several adjacent conversions share the same rationale, group them in a
+small inner module so the attribute appears once:
+
+```rust
+#![expect(
+    unknown_lints,
+    de1302_error_from_to_string,
+    reason = "MyError::Internal collapses many sources into a String. \
+              Extend to a boxed-source variant in a follow-up PR, then \
+              drop this expect."
+)]
+mod error_froms {
+    use super::MyError;
+
+    impl From<A> for MyError { fn from(e: A) -> Self { Self::Internal(e.to_string()) } }
+    impl From<B> for MyError { fn from(e: B) -> Self { Self::Internal(e.to_string()) } }
+    impl From<C> for MyError { fn from(e: C) -> Self { Self::Internal(e.to_string()) } }
+}
+```
+
+The `reason` field is also machine-readable — `cargo clippy --message-format=json`
+exposes it, so a debt-audit script can list every silenced site with its
+explanation in one pass.
+
+### Acceptable: `#[allow]` with a `TODO(DE1302)` comment
+
+For sites that pre-date the `#[expect]` recommendation, or when you
+specifically don't want the auto-warn behaviour, the older pattern still
+works:
 
 ```rust
 // TODO(DE1302): `Internal` only carries a String; extend to hold a boxed
@@ -251,23 +394,17 @@ impl From<SomeError> for MyError {
 }
 ```
 
-If several adjacent conversions share the same TODO, group them in a small
-inner module so the attribute appears once:
+The trade-off: an `#[allow]` doesn't notice when the underlying fix lands, so
+it can rot in the codebase indefinitely. Migrate to `#[expect]` whenever you
+touch a silenced site.
 
-```rust
-// TODO(DE1302): see above.
-#[allow(unknown_lints, de1302_error_from_to_string)]
-mod error_froms {
-    use super::MyError;
+### Why `unknown_lints` is in the list
 
-    impl From<A> for MyError { fn from(e: A) -> Self { Self::Internal(e.to_string()) } }
-    impl From<B> for MyError { fn from(e: B) -> Self { Self::Internal(e.to_string()) } }
-    impl From<C> for MyError { fn from(e: C) -> Self { Self::Internal(e.to_string()) } }
-}
-```
-
-The `unknown_lints` allow lets the attribute compile under regular `cargo
-check` / `cargo clippy` runs that don't load the dylint driver.
+The dylint driver is only loaded by `make dylint`. Plain `cargo check` /
+`cargo clippy` doesn't know about `de1302_error_from_to_string` and would
+otherwise reject the attribute as an unknown lint name. Adding
+`unknown_lints` to the same `#[expect]` / `#[allow]` makes the attribute
+parse cleanly under both toolchains.
 
 ## UI Tests
 
