@@ -928,7 +928,7 @@ Identifiers under the `gts.cf.qe.resource.*` namespace:
 
 | `DomainError` variant family                                                                                                                                                                                                                                                                            | `CanonicalError`     | HTTP | Reason / context                                                                                                                                   |
 | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | -------------------- | ---- | -------------------------------------------------------------------------------------------------------------------------------------------------- |
-| Field validation: `UnknownSubjectType`, `CapMustBeNonNegative`, `BulkTooLarge`, `InvalidAmount`                                                                                                                                                                                                         | `InvalidArgument`    | 400  | matching `UPPER_SNAKE` token (field violation)                                                                                                     |
+| Field validation: `UnknownSubjectType`, `CapMustBeNonNegative`, `BulkTooLarge`, `InvalidAmount`, `TtlOutOfBounds`                                                                                                                                                                                       | `InvalidArgument`    | 400  | matching `UPPER_SNAKE` token (field violation)                                                                                                     |
 | Semantic precondition: `ThresholdsRequireBoundedCap`, `CapBelowConsumed`, `LeaseNotActive`, `OverCommitNotAuthorized`, `PeriodClosed`, `MetricNotQuotaGated`, `MetricNotRegistered`, `QuotaDeactivated`, `UnknownEngine`, `CannotDeleteSeededGlobalPolicy`, `UnknownPolicyVersion`, `VersionRolledBack` | `FailedPrecondition` | 400  | matching `UPPER_SNAKE` token (precondition violation)                                                                                              |
 | `PdpDenied`                                                                                                                                                                                                                                                                                             | `PermissionDenied`   | 403  | —                                                                                                                                                  |
 | `NotFound { kind, id }`                                                                                                                                                                                                                                                                                 | `NotFound`           | 404  | `kind` selects `type`; `id` populates `resource_name`                                                                                              |
@@ -1518,38 +1518,45 @@ sequenceDiagram
     participant SP as StoragePlugin
     participant ER as EngineRegistry
 
-    Caller ->> GW: POST /leases (AcquireLeaseRequest with TTL, idem_key)
-    GW ->> EO: evaluate(ctx, acquire_req)
-    EO ->> SP: lookup_idempotency
-    alt replay
-        SP -->> EO: stored LeaseToken
-        EO -->> Caller: stored LeaseToken
-    else fresh
-        EO ->> SP: BEGIN tx + read_quota_snapshot with row lock
-        SP -->> EO: Vec<QuotaSnapshot>
-        EO ->> ER: evaluate (admission)
-        ER -->> EO: Decision (Allowed + debit_plan)
-        EO ->> EO: validate invariants
-        EO ->> LM: acquire(ctx, applicable, plan, ttl, idem_key)
-        LM ->> SP: lock lease_capacity_counter(tenant, metric)
-        alt cap exceeded
-            SP -->> LM: StorageError::LeaseInflightLimitExceeded
-            LM -->> Caller: 429 LEASE_INFLIGHT_LIMIT_EXCEEDED (DomainError::LeaseInflightLimitExceeded)
-        else under cap
-            LM ->> SP: INSERT lease + N lease_holds + increment cap counter
-            Note over SP: capture acquisition_period_id<br/>per consumption Quota
-            SP ->> SP: persist idempotency_record + COMMIT
-            SP -->> LM: LeaseToken { token, expiry_at }
-            LM -->> Caller: { lease_token, expiry_at }
+    Caller ->> GW: POST /leases (AcquireLeaseRequest with ttl, idem_key)
+    GW ->> GW: validate ttl against [min_lease_ttl, max_lease_ttl]
+    alt ttl missing or outside [min_lease_ttl, max_lease_ttl]
+        GW -->> Caller: 400 TTL_OUT_OF_BOUNDS (DomainError::TtlOutOfBounds)
+    else ttl in window
+        GW ->> EO: evaluate(ctx, acquire_req)
+        EO ->> SP: lookup_idempotency
+        alt replay
+            SP -->> EO: stored LeaseToken
+            EO -->> Caller: stored LeaseToken
+        else fresh
+            EO ->> SP: BEGIN tx + read_quota_snapshot with row lock
+            SP -->> EO: Vec<QuotaSnapshot>
+            EO ->> ER: evaluate (admission)
+            ER -->> EO: Decision (Allowed + debit_plan)
+            EO ->> EO: validate invariants
+            EO ->> LM: acquire(ctx, applicable, plan, ttl, idem_key)
+            LM ->> SP: lock lease_capacity_counter(tenant, metric)
+            alt cap exceeded
+                SP -->> LM: StorageError::LeaseInflightLimitExceeded
+                LM -->> Caller: 429 LEASE_INFLIGHT_LIMIT_EXCEEDED (DomainError::LeaseInflightLimitExceeded)
+            else under cap
+                LM ->> SP: INSERT lease + N lease_holds + increment cap counter
+                Note over SP: capture acquisition_period_id<br/>per consumption Quota
+                SP ->> SP: persist idempotency_record + COMMIT
+                SP -->> LM: LeaseToken { token, expiry_at }
+                LM -->> Caller: { lease_token, expiry_at }
+            end
         end
     end
 ```
 
-**Description.** Atomic multi-Quota acquisition (`cpt-cf-quota-enforcement-fr-lease-acquire`). The active-lease cap
-(default 1000 per `(tenant, metric)`, PRD §5.6) is enforced atomically same-tx with the lease insert (I7); over-cap
-requests are rejected without holding any Quota. `acquisition_period_id` is captured at this step for every consumption
-Quota in the plan, locking in the period attribution for the lease's lifetime regardless of when commit / release
-actually fires (I5).
+**Description.** Atomic multi-Quota acquisition (`cpt-cf-quota-enforcement-fr-lease-acquire`). TTL bounds are enforced
+at the gateway before idempotency lookup: `ttl` is required, and a missing field or a value outside
+`[min_lease_ttl, max_lease_ttl]` is rejected with `TTL_OUT_OF_BOUNDS` and never reaches the Engine, idempotency, or
+capacity-hold paths (mirrors the `INVALID_AMOUNT` fail-fast). The active-lease cap (default 1000 per `(tenant, metric)`,
+PRD §5.6) is enforced atomically same-tx with the lease insert (I7); over-cap requests are rejected without holding any
+Quota. `acquisition_period_id` is captured at this step for every consumption Quota in the plan, locking in the period
+attribution for the lease's lifetime regardless of when commit / release actually fires (I5).
 
 #### Lease Commit (with cross-period boundary)
 

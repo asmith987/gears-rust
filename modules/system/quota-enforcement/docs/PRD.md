@@ -1253,9 +1253,16 @@ rejected with an actionable `INVALID_AMOUNT` error **before** idempotency lookup
 hold acquisition — no idempotency record is persisted, no lease row is created, no Quota's capacity is reserved, the
 per-`(tenant, metric)` active-lease counter is unchanged.
 
-The lease TTL **MUST** be specified by the caller within operator-configured minimum and maximum bounds (default range:
-1 second to 1 hour). The system **MUST** persist the lease token, the held amount, the affected Quotas, the owning
-subject context, and the expiry timestamp.
+The lease TTL **MUST** be supplied by the caller and **MUST** fall within an operator-configurable window
+`[min_lease_ttl, max_lease_ttl]` (platform defaults: 1 s and 1 h respectively). A TTL outside the window — or a missing
+`ttl` field — **MUST** be rejected with an actionable `TTL_OUT_OF_BOUNDS` error **before** idempotency lookup,
+multi-quota evaluation, or any hold acquisition — no idempotency record, no lease row, no capacity hold, no change to
+the per-`(tenant, metric)` active-lease counter (mirroring the `INVALID_AMOUNT` fail-fast above). Clamping is **NOT**
+performed: silent TTL adjustment would mask client miscalculations and is incompatible with the lease contract, which
+entitles the holder to the exact TTL it reserved.
+
+The system **MUST** persist the lease token, the held amount, the affected Quotas, the owning subject context, and the
+expiry timestamp.
 
 **Atomic multi-Quota acquisition.** When the Engine's Debit Plan names multiple Quotas (e.g., a user-scoped Quota plus a
 tenant-scoped Quota that both apply to one operation, or several Quotas selected by a cascade or attribute-based
@@ -2751,7 +2758,8 @@ on behalf of a tenant administrator)
 
 **Main Flow**:
 
-1. Consumer calls `reserve(metric, amount, ttl, idempotency_key)` with the worst-case estimate
+1. Consumer calls `reserve(metric, amount, ttl, idempotency_key)` with the worst-case estimate; `ttl` **MUST** lie
+   within the operator-configurable `[min_lease_ttl, max_lease_ttl]` window per `cpt-cf-quota-enforcement-fr-lease-acquire`
 1. Quota Enforcement evaluates the lease against applicable Quotas under the active Quota Resolution Policy; returns
    `lease_token` on success or denial otherwise
 1. Consumer performs the long-running operation (e.g., 30-minute compute job)
@@ -2955,6 +2963,11 @@ on behalf of a tenant administrator)
   semantic)
 - [ ] Per-`(tenant, metric)` active-lease cap (default: 1000) is enforced at acquisition time; requests exceeding the
   cap are rejected with `LEASE_INFLIGHT_LIMIT_EXCEEDED`; expired leases do not count toward the cap
+- [ ] Lease TTL is required on every acquire request and **MUST** fall within the operator-configurable
+  `[min_lease_ttl, max_lease_ttl]` window (platform defaults: 1 s / 1 h); a missing `ttl` or a value outside the window is rejected
+  with `TTL_OUT_OF_BOUNDS` before idempotency lookup, multi-quota evaluation, or any hold acquisition — no idempotency
+  record, no lease row, no capacity hold, and no change to the per-`(tenant, metric)` active-lease counter; clamping is
+  not performed
 - [ ] Multi-Quota lease acquisition is atomic: when the Engine's Debit Plan names multiple Quotas, holds are placed on
   every named Quota or none; partial holds are never observable, including under concurrent contention. Concurrent
   multi-Quota lease traffic does not deadlock the acquisition path
