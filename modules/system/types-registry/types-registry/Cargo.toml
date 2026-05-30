@@ -45,7 +45,6 @@ modkit = { workspace = true }
 modkit-canonical-errors = { workspace = true, features = ["axum"] }
 modkit-gts = { workspace = true }
 modkit-macros = { workspace = true }
-modkit-security = { workspace = true }
 modkit-utils = { workspace = true }
 
 [dev-dependencies]

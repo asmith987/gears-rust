@@ -301,7 +301,8 @@ struct MatchRules {
 /// Intermediate serde struct for deserializing upstream GTS entity content.
 #[derive(Deserialize)]
 struct UpstreamPayload {
-    tenant_id: Uuid,
+    #[serde(default)]
+    tenant_id: Option<Uuid>,
     server: Server,
     protocol: String,
     #[serde(default)]
@@ -325,7 +326,8 @@ struct UpstreamPayload {
 /// Intermediate serde struct for deserializing route GTS entity content.
 #[derive(Deserialize)]
 struct RoutePayload {
-    tenant_id: Uuid,
+    #[serde(default)]
+    tenant_id: Option<Uuid>,
     upstream_id: String,
     #[serde(rename = "match")]
     match_rules: MatchRules,
@@ -832,7 +834,7 @@ mod tests {
 
         let upstreams = svc.list_upstreams().await.unwrap();
         assert_eq!(upstreams.len(), 1);
-        assert_eq!(upstreams[0].tenant_id, tenant);
+        assert_eq!(upstreams[0].tenant_id, Some(tenant));
         assert_eq!(upstreams[0].request.id, Some(instance_id));
         assert!(upstreams[0].request.enabled);
     }
@@ -913,7 +915,7 @@ mod tests {
 
         let routes = svc.list_routes().await.unwrap();
         assert_eq!(routes.len(), 1);
-        assert_eq!(routes[0].tenant_id, tenant);
+        assert_eq!(routes[0].tenant_id, Some(tenant));
         assert_eq!(routes[0].request.id, Some(route_instance_id));
         assert_eq!(routes[0].request.upstream_id, upstream_id);
         assert!(routes[0].request.enabled);
@@ -1033,7 +1035,7 @@ mod tests {
         let payload: UpstreamPayload = serde_json::from_value(json).unwrap();
         let provisioned = payload.into_provisioned(None);
 
-        assert_eq!(provisioned.tenant_id, tenant);
+        assert_eq!(provisioned.tenant_id, Some(tenant));
         let req = &provisioned.request;
         assert_eq!(req.server.endpoints.len(), 2);
         assert_eq!(req.server.endpoints[0].scheme, domain::Scheme::Https);
@@ -1098,7 +1100,7 @@ mod tests {
             .into_provisioned("gts.cf.core.oagw.route.v1~cf.core.oagw.test.v1", route_uuid)
             .expect("upstream_id should parse");
 
-        assert_eq!(provisioned.tenant_id, tenant);
+        assert_eq!(provisioned.tenant_id, Some(tenant));
         let req = &provisioned.request;
         assert_eq!(req.upstream_id, upstream_id);
         assert_eq!(req.priority, 10);
@@ -1126,6 +1128,67 @@ mod tests {
         assert_eq!(rl.scope, domain::RateLimitScope::Tenant);
         assert_eq!(rl.strategy, domain::RateLimitStrategy::Reject);
         assert_eq!(rl.cost, 2);
+    }
+
+    #[test]
+    fn deserialize_upstream_without_tenant_id_produces_none() {
+        let json = serde_json::json!({
+            "server": {
+                "endpoints": [{"host": "api.example.com", "port": 443, "scheme": "https"}]
+            },
+            "protocol": "http"
+        });
+        let payload: UpstreamPayload = serde_json::from_value(json).unwrap();
+        let provisioned = payload.into_provisioned(None);
+        assert_eq!(provisioned.tenant_id, None);
+    }
+
+    #[test]
+    fn deserialize_route_without_tenant_id_produces_none() {
+        let upstream_id = Uuid::new_v4();
+        let json = serde_json::json!({
+            "upstream_id": upstream_id,
+            "match": {
+                "http": {
+                    "methods": ["GET"],
+                    "path": "/api/test"
+                }
+            },
+            "enabled": true,
+            "tags": [],
+            "priority": 0
+        });
+        let payload: RoutePayload = serde_json::from_value(json).unwrap();
+        let route_uuid = Uuid::new_v4();
+        let provisioned = payload
+            .into_provisioned("gts.cf.core.oagw.route.v1~cf.core.oagw.test.v1", route_uuid)
+            .unwrap();
+        assert_eq!(provisioned.tenant_id, None);
+    }
+
+    #[tokio::test]
+    async fn list_upstreams_without_tenant_id_returns_none() {
+        let instance_id = Uuid::new_v4();
+        let content = serde_json::json!({
+            "server": {
+                "endpoints": [{"host": "127.0.0.1", "port": 8080, "scheme": "http"}]
+            },
+            "protocol": "gts.cf.core.oagw.protocol.v1~cf.core.oagw.http.v1",
+            "enabled": true,
+            "tags": []
+        });
+        let gts_id = format!("gts.cf.core.oagw.upstream.v1~{instance_id}");
+
+        let registry = Arc::new(
+            MockTypesRegistryClient::new()
+                .with_instances([make_upstream_instance(&gts_id, content)]),
+        );
+        let svc = TypeProvisioningServiceImpl::new(registry);
+
+        let upstreams = svc.list_upstreams().await.unwrap();
+        assert_eq!(upstreams.len(), 1);
+        assert_eq!(upstreams[0].tenant_id, None);
+        assert_eq!(upstreams[0].request.id, Some(instance_id));
     }
 
     #[test]

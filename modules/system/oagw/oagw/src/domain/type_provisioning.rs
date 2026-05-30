@@ -17,7 +17,7 @@ use uuid::Uuid;
 #[domain_model]
 #[derive(Debug, Clone)]
 pub struct ProvisionedUpstream {
-    pub tenant_id: Uuid,
+    pub tenant_id: Option<Uuid>,
     pub request: CreateUpstreamRequest,
 }
 
@@ -28,7 +28,7 @@ pub struct ProvisionedUpstream {
 #[domain_model]
 #[derive(Debug, Clone)]
 pub struct ProvisionedRoute {
-    pub tenant_id: Uuid,
+    pub tenant_id: Option<Uuid>,
     pub request: CreateRouteRequest,
 }
 

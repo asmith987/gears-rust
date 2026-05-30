@@ -3143,7 +3143,6 @@ dependencies = [
  "cyberware-modkit-canonical-errors",
  "cyberware-modkit-gts",
  "cyberware-modkit-macros",
- "cyberware-modkit-security",
  "cyberware-modkit-utils",
  "cyberware-types-registry-sdk",
  "gts",

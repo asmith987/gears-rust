@@ -75,7 +75,6 @@ impl Module for TypesRegistryModule {
 
         let gts_config = cfg.to_gts_config();
         let static_entities = cfg.entities.clone();
-        let default_tenant_id = cfg.default_tenant_id;
         let type_schemas_cache_cfg = cfg.local_client.cache.type_schemas.to_cache_config();
         let instances_cache_cfg = cfg.local_client.cache.instances.to_cache_config();
 
@@ -105,20 +104,8 @@ impl Module for TypesRegistryModule {
 
         // Register static entities from config (before ready-mode validation)
         if !static_entities.is_empty() {
-            let tenant_id_str = default_tenant_id.to_string();
-            let entities: Vec<serde_json::Value> = static_entities
-                .into_iter()
-                .map(|mut v| {
-                    if let Some(obj) = v.as_object_mut() {
-                        obj.entry("tenant_id")
-                            .or_insert_with(|| serde_json::Value::String(tenant_id_str.clone()));
-                    }
-                    v
-                })
-                .collect();
-
-            let entity_count = entities.len();
-            let results = service.register(entities);
+            let entity_count = static_entities.len();
+            let results = service.register(static_entities);
             let summary = RegisterSummary::from_results(&results);
 
             if !summary.all_succeeded() {

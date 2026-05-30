@@ -46,6 +46,7 @@ pub struct AppState {
 pub struct OutboundApiGatewayModule {
     state: arc_swap::ArcSwapOption<AppState>,
     registry_client: OnceLock<Arc<dyn TypesRegistryClient>>,
+    tenant_resolver: OnceLock<Arc<dyn TenantResolverClient>>,
     type_provisioning: OnceLock<Arc<dyn TypeProvisioningService>>,
 }
 
@@ -54,6 +55,7 @@ impl Default for OutboundApiGatewayModule {
         Self {
             state: arc_swap::ArcSwapOption::from(None),
             registry_client: OnceLock::new(),
+            tenant_resolver: OnceLock::new(),
             type_provisioning: OnceLock::new(),
         }
     }
@@ -88,7 +90,7 @@ impl Module for OutboundApiGatewayModule {
         let cp: Arc<dyn ControlPlaneService> = Arc::new(ControlPlaneServiceImpl::new(
             upstream_repo,
             route_repo,
-            tenant_resolver,
+            tenant_resolver.clone(),
             policy_enforcer.clone(),
             credstore.clone(),
             ssrf_guard.clone(),
@@ -193,6 +195,10 @@ impl Module for OutboundApiGatewayModule {
             .set(registry)
             .map_err(|_| anyhow::anyhow!("TypesRegistryClient already set"))?;
 
+        self.tenant_resolver
+            .set(tenant_resolver)
+            .map_err(|_| anyhow::anyhow!("TenantResolverClient already set"))?;
+
         let app_state = AppState {
             cp,
             dp,
@@ -215,6 +221,12 @@ impl SystemCapability for OutboundApiGatewayModule {
             .ok_or_else(|| anyhow::anyhow!("TypesRegistryClient not set — init() must run first"))?
             .clone();
 
+        let tenant_resolver = self
+            .tenant_resolver
+            .get()
+            .ok_or_else(|| anyhow::anyhow!("TenantResolverClient not set — init() must run first"))?
+            .clone();
+
         let provisioning: Arc<dyn TypeProvisioningService> =
             Arc::new(TypeProvisioningServiceImpl::new(registry));
 
@@ -227,6 +239,18 @@ impl SystemCapability for OutboundApiGatewayModule {
             .as_ref()
             .clone();
 
+        // Resolve root tenant for provisioning context.
+        let bootstrap_ctx = SecurityContext::builder()
+            .subject_id(modkit_security::constants::DEFAULT_SUBJECT_ID)
+            .subject_tenant_id(modkit_security::constants::DEFAULT_TENANT_ID)
+            .build()?;
+        let root_tenant_id = tenant_resolver
+            .get_root_tenant(&bootstrap_ctx)
+            .await
+            .map_err(|e| anyhow::anyhow!("Failed to resolve root tenant: {e}"))?
+            .id
+            .0;
+
         // -- Materialise upstreams and routes from types-registry --
         // GTS instance UUIDs are passed through as `CreateUpstreamRequest.id`
         // and `CreateRouteRequest.id`, so OAGW uses the config-provided IDs
@@ -234,8 +258,9 @@ impl SystemCapability for OutboundApiGatewayModule {
         // instance UUID, so no remapping is needed.
         let upstreams = provisioning.list_upstreams().await?;
         for u in &upstreams {
+            let tenant_id = u.tenant_id.unwrap_or(root_tenant_id);
             let ctx = SecurityContext::builder()
-                .subject_tenant_id(u.tenant_id)
+                .subject_tenant_id(tenant_id)
                 .subject_id(modkit_security::constants::DEFAULT_SUBJECT_ID)
                 .build()?;
             let created = app_state
@@ -243,11 +268,11 @@ impl SystemCapability for OutboundApiGatewayModule {
                 .create_upstream(&ctx, u.request.clone())
                 .await
                 .map_err(|e| {
-                    anyhow::anyhow!("Failed to provision upstream (tenant={}): {e}", u.tenant_id)
+                    anyhow::anyhow!("Failed to provision upstream (tenant={tenant_id}): {e}")
                 })?;
             info!(
                 id = %created.id,
-                tenant_id = %u.tenant_id,
+                tenant_id = %tenant_id,
                 alias = %created.alias,
                 "Provisioned upstream from types-registry"
             );
@@ -255,8 +280,9 @@ impl SystemCapability for OutboundApiGatewayModule {
 
         let routes = provisioning.list_routes().await?;
         for r in &routes {
+            let tenant_id = r.tenant_id.unwrap_or(root_tenant_id);
             let ctx = SecurityContext::builder()
-                .subject_tenant_id(r.tenant_id)
+                .subject_tenant_id(tenant_id)
                 .subject_id(modkit_security::constants::DEFAULT_SUBJECT_ID)
                 .build()?;
             let created = app_state
@@ -264,11 +290,11 @@ impl SystemCapability for OutboundApiGatewayModule {
                 .create_route(&ctx, r.request.clone())
                 .await
                 .map_err(|e| {
-                    anyhow::anyhow!("Failed to provision route (tenant={}): {e}", r.tenant_id)
+                    anyhow::anyhow!("Failed to provision route (tenant={tenant_id}): {e}")
                 })?;
             info!(
                 id = %created.id,
-                tenant_id = %r.tenant_id,
+                tenant_id = %tenant_id,
                 "Provisioned route from types-registry"
             );
         }

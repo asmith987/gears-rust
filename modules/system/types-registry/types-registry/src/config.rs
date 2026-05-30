@@ -3,7 +3,6 @@
 use std::time::Duration;
 
 use serde::Deserialize;
-use uuid::Uuid;
 
 use crate::infra::cache::{CacheConfig, DEFAULT_CACHE_CAPACITY, DEFAULT_CACHE_TTL};
 
@@ -18,14 +17,6 @@ pub struct TypesRegistryConfig {
     /// Fields to check for schema ID reference (in order of priority).
     /// Default: `["$schema", "gtsTid", "type"]`
     pub schema_id_fields: Vec<String>,
-
-    /// Default tenant ID injected into static entities that don't specify one.
-    ///
-    /// When a static entity in `entities` has no `tenant_id` field, this value
-    /// is automatically inserted before registration. Defaults to
-    /// `modkit_security::constants::DEFAULT_TENANT_ID`.
-    #[serde(default = "default_tenant_id")]
-    pub default_tenant_id: Uuid,
 
     /// Raw GTS entity JSON values to register at startup.
     ///
@@ -96,16 +87,11 @@ impl SingleCacheSettings {
     }
 }
 
-fn default_tenant_id() -> Uuid {
-    modkit_security::constants::DEFAULT_TENANT_ID
-}
-
 impl Default for TypesRegistryConfig {
     fn default() -> Self {
         Self {
             entity_id_fields: vec!["$id".to_owned(), "gtsId".to_owned(), "id".to_owned()],
             schema_id_fields: vec!["$schema".to_owned(), "gtsTid".to_owned(), "type".to_owned()],
-            default_tenant_id: default_tenant_id(),
             entities: Vec::new(),
             local_client: LocalClientSettings::default(),
         }
@@ -133,10 +119,6 @@ mod tests {
         assert_eq!(cfg.entity_id_fields, vec!["$id", "gtsId", "id"]);
         assert_eq!(cfg.schema_id_fields, vec!["$schema", "gtsTid", "type"]);
         assert!(cfg.entities.is_empty());
-        assert_eq!(
-            cfg.default_tenant_id,
-            modkit_security::constants::DEFAULT_TENANT_ID
-        );
     }
 
     #[test]
