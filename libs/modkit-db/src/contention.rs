@@ -44,6 +44,16 @@ const MYSQL_DEADLOCK_SQLSTATE: &str = "40001";
 const PG_SERIALIZATION_FAILURE: &str = "40001";
 const PG_DEADLOCK_DETECTED: &str = "40P01";
 
+/// `PostgreSQL` retryable error MESSAGE fragments. sea-orm/sqlx surface the
+/// condition through the error's *message text* on the `Display` path, not the
+/// numeric SQLSTATE — so matching the code alone (`40001` / `40P01`) misses real
+/// serialization failures and deadlocks (e.g. `"could not serialize access due
+/// to concurrent update"` carries no `"40001"` substring). Matching the message
+/// is the reliable signal here. Message text is `lc_messages`-dependent, so the
+/// numeric-code checks above remain as a locale-independent belt-and-suspenders.
+const PG_SERIALIZATION_MSG: &str = "could not serialize access";
+const PG_DEADLOCK_MSG: &str = "deadlock detected";
+
 /// `SQLite` error codes for write contention.
 ///
 /// sqlx surfaces these as `"error returned from database: (code: N) database is locked"`.
@@ -82,7 +92,10 @@ fn is_mysql_deadlock(msg: &str) -> bool {
 }
 
 fn is_pg_contention(msg: &str) -> bool {
-    msg.contains(PG_SERIALIZATION_FAILURE) || msg.contains(PG_DEADLOCK_DETECTED)
+    msg.contains(PG_SERIALIZATION_FAILURE)
+        || msg.contains(PG_DEADLOCK_DETECTED)
+        || msg.contains(PG_SERIALIZATION_MSG)
+        || msg.contains(PG_DEADLOCK_MSG)
 }
 
 fn is_sqlite_busy(msg: &str) -> bool {
@@ -123,6 +136,23 @@ mod tests {
     #[test]
     fn pg_deadlock_detected() {
         let err = exec_err("error returned from database: error with SQLSTATE 40P01");
+        assert!(is_retryable_contention(DbBackend::Postgres, &err));
+    }
+
+    #[test]
+    fn pg_serialization_failure_by_message_detected() {
+        // Real sea-orm/sqlx Display carries the message, not the numeric
+        // SQLSTATE — this is the exact text Postgres emits for 40001 and the
+        // concurrent-DELETE regression that the numeric-only match missed.
+        let err = exec_err(
+            "error returned from database: could not serialize access due to concurrent update",
+        );
+        assert!(is_retryable_contention(DbBackend::Postgres, &err));
+    }
+
+    #[test]
+    fn pg_deadlock_by_message_detected() {
+        let err = exec_err("error returned from database: deadlock detected");
         assert!(is_retryable_contention(DbBackend::Postgres, &err));
     }
 
