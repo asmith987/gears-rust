@@ -27,7 +27,7 @@ from lib.platform import (
     stop_process_tree,
 )
 
-PROJECT_ROOT = Path(__file__).parent.parent.absolute()
+PROJECT_ROOT = Path(__file__).parent.parent.parent.absolute()
 COVERAGE_DIR = PROJECT_ROOT / "coverage"
 PYTHON = sys.executable or "python3"
 COVERAGE_THRESHOLD = 80
