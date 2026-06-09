@@ -102,11 +102,28 @@ fn remove_fixture_lockfile(fixture: &Path) {
 }
 
 fn assert_success(name: &str, output: &Output) {
-    assert!(
-        output.status.success(),
-        "fixture `{name}` failed\nstdout:\n{}\nstderr:\n{}",
+    if output.status.success() {
+        return;
+    }
+
+    let toolchain = std::env::var("RUSTUP_TOOLCHAIN").unwrap_or_else(|_| "<unset>".into());
+    let has_dylint_link = std::env::var_os("PATH")
+        .map(|path| {
+            std::env::split_paths(&path)
+                .any(|dir| dir.join("dylint-link").exists())
+        })
+        .unwrap_or(false);
+
+    panic!(
+        "fixture `{name}` failed (exit code: {:?})\n\
+         --- diagnostics ---\n\
+         RUSTUP_TOOLCHAIN={toolchain}\n\
+         dylint-link in PATH: {has_dylint_link}\n\
+         --- stdout ---\n{}\n\
+         --- stderr ---\n{}",
+        output.status.code(),
         String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        String::from_utf8_lossy(&output.stderr),
     );
 }
 
