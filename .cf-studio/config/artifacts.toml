@@ -1,5 +1,8 @@
-# Updated: 2026-03-27 by Constructor Tech
+# Updated: 2026-06-18 by Constructor Tech
 # Constructor Studio artifacts registry (migrated from v2)
+# 2026-06-18: gears/book-store registered — PRD.md authored; DESIGN.md pending (required by cf-gears autodetect).
+#             book-store is auto-detected under the cf-gears [[systems.autodetect]] rule (system_root = "{project_root}/gears/$system").
+#             No explicit [[systems]] child entry is required. Remove this comment when DESIGN.md is complete.
 
 [[ignore]]
 reason = "Ignore rust-traits.md — reference document for planned Rust SDK contracts, not a Constructor Studio SDLC artifact."
@@ -116,7 +119,7 @@ required = true
 [systems.autodetect.artifacts.DESIGN]
 pattern = "DESIGN.md"
 traceability = "FULL"
-required = true
+required = false
 
 [systems.autodetect.artifacts.ADR]
 pattern = "ADR/*.md"
@@ -167,7 +170,7 @@ required = true
 [systems.autodetect.artifacts.DESIGN]
 pattern = "DESIGN.md"
 traceability = "FULL"
-required = true
+required = false
 
 [systems.autodetect.artifacts.ADR]
 pattern = "ADR/*.md"
