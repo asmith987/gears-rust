@@ -384,7 +384,7 @@ Gears can also run as separate processes communicating via gRPC.
 - [x] `HostRuntime` contains explicit OoP orchestration hooks.
 - [x] `toolkit-transport-grpc` exists as a transport library.
 - [x] `docs/toolkit_unified_system/09_oop_grpc_sdk_pattern.md` documents the pattern.
-- [x] `examples/oop-gears/` demonstrates the model with calculator examples.
+- [x] `examples/toolkit/api-contracts/`, `examples/toolkit/users-info/`, and `examples/toolkit/hello/` demonstrate the out-of-process model.
 
 ## 10. Security architecture
 
