@@ -22,6 +22,11 @@ fn default_gateway_sync_interval_secs() -> u64 {
 #[allow(clippy::struct_excessive_bools)]
 pub struct ApiGatewayConfig {
     pub bind_addr: String,
+
+    /// Base URL to reach this gateway's REST endpoint
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub advertise_uri: Option<String>,
+
     #[serde(default)]
     pub enable_docs: bool,
     #[serde(default)]
@@ -189,6 +194,7 @@ impl Default for ApiGatewayConfig {
     fn default() -> Self {
         Self {
             bind_addr: String::default(),
+            advertise_uri: None,
             enable_docs: false,
             cors_enabled: false,
             cors: None,
