@@ -241,6 +241,48 @@ where
     .await
 }
 
+/// Build a **lazily-connecting** gRPC client channel.
+///
+/// Unlike [`connect_with_stack`] and [`connect_with_retry`], this performs **no**
+/// eager TCP/HTTP2 connection: it validates the URI, builds the transport stack,
+/// and returns immediately with a `Channel` that establishes (and transparently
+/// re-establishes) the connection on first use.
+///
+/// This is the eventual-readiness entry point (`cpt-cf-adr-eventual-readiness`):
+/// a process can start before its dependency is reachable without blocking or
+/// crashing at bootstrap. The first RPC absorbs the startup window (pair it with
+/// a caller-side retry loop such as the `OoP` presence loop, which retries with
+/// backoff), and tonic reconnects automatically after transient failures.
+///
+/// # Runtime context
+/// Although this does not connect, it must be called from within a Tokio
+/// runtime context: building the lazy `Channel` initialises the hyper reactor.
+/// Calling it outside a runtime will panic.
+///
+/// # Errors
+/// Returns an error only if `uri` is not a valid endpoint (parse failure). It
+/// never errors for an unreachable peer — that is deferred to the first RPC.
+pub fn connect_lazy<TClient>(
+    uri: impl Into<String>,
+    cfg: &GrpcClientConfig,
+) -> anyhow::Result<TClient>
+where
+    TClient: From<Channel>,
+{
+    let uri_string = uri.into();
+    let endpoint = build_endpoint(uri_string, cfg)?;
+    let channel = endpoint.connect_lazy();
+
+    if cfg.enable_tracing {
+        tracing::debug!(
+            service_name = cfg.service_name,
+            "gRPC client created (lazy connect; connects on first use)"
+        );
+    }
+
+    Ok(TClient::from(channel))
+}
+
 /// Connect to a gRPC service with retry logic using exponential backoff and jitter.
 ///
 /// This function attempts to establish a connection and retries on failure
@@ -411,5 +453,45 @@ mod tests {
         let cfg = GrpcClientConfig::default();
         let result = build_endpoint(String::new(), &cfg);
         assert!(result.is_err(), "build_endpoint should fail with empty URI");
+    }
+
+    #[tokio::test]
+    async fn test_connect_lazy_does_not_connect_eagerly() {
+        // A lazy channel must succeed even against an address nothing is
+        // listening on: no eager TCP connect happens, so an unreachable peer
+        // cannot fail bootstrap (`cpt-cf-adr-eventual-readiness`). The connect
+        // is deferred to the first RPC. (`connect_lazy` still needs a Tokio
+        // runtime context for the hyper reactor, which OoP bootstrap always
+        // has.)
+        let cfg = GrpcClientConfig::default();
+        let result: anyhow::Result<Channel> = connect_lazy("http://127.0.0.1:1", &cfg);
+        assert!(
+            result.is_ok(),
+            "connect_lazy must return Ok for an unreachable peer (no eager connect)"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_connect_lazy_without_tracing_skips_debug_log() {
+        // Exercise the `enable_tracing == false` branch (the default is `true`):
+        // the client is still built successfully, the debug log is just skipped.
+        let cfg = GrpcClientConfig::default().without_tracing();
+        let result: anyhow::Result<Channel> = connect_lazy("http://127.0.0.1:1", &cfg);
+        assert!(
+            result.is_ok(),
+            "connect_lazy must build the client regardless of tracing"
+        );
+    }
+
+    #[tokio::test]
+    async fn test_connect_lazy_rejects_malformed_uri() {
+        // The only failure mode of a lazy connect is a malformed endpoint,
+        // which is a static config error worth failing fast on.
+        let cfg = GrpcClientConfig::default();
+        let result: anyhow::Result<Channel> = connect_lazy(String::new(), &cfg);
+        assert!(
+            result.is_err(),
+            "connect_lazy should fail fast on a malformed URI"
+        );
     }
 }
