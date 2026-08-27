@@ -511,6 +511,9 @@ rustls-native-certs = "0.8"
 rustls-pki-types = "1"
 tokio-rustls = { version = "0.26", default-features = false, features = ["aws-lc-rs"] }
 rcgen = { version = "0.14", default-features = false, features = ["aws_lc_rs", "pem"] }
+# X.509 parsing for extracting the SPIFFE URI SAN from a verified client cert.
+# Pinned to 0.18 (already present transitively) to avoid a third lockfile version.
+x509-parser = "0.18"
 http-body-util = "0.1"
 http-body = "1"
 

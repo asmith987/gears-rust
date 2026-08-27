@@ -2459,6 +2459,8 @@ dependencies = [
  "http",
  "inventory",
  "parking_lot",
+ "rcgen",
+ "rustls",
  "secrecy",
  "serde",
  "serde_json",
@@ -3694,11 +3696,14 @@ name = "cf-gears-toolkit-transport-grpc"
 version = "0.7.4"
 dependencies = [
  "anyhow",
+ "arc-swap",
  "cf-gears-toolkit-security",
  "futures-util",
  "http",
  "parking_lot",
  "rand 0.10.1",
+ "rcgen",
+ "rustls-pki-types",
  "secrecy",
  "serde",
  "serde_json",
@@ -3710,6 +3715,7 @@ dependencies = [
  "tonic",
  "tower",
  "tracing",
+ "x509-parser 0.18.1",
 ]
 
 [[package]]
@@ -11520,6 +11526,7 @@ dependencies = [
  "socket2",
  "sync_wrapper",
  "tokio",
+ "tokio-rustls",
  "tokio-stream",
  "tower",
  "tower-layer",

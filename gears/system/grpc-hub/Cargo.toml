@@ -42,13 +42,22 @@ serde_json = { workspace = true }
 serde = { workspace = true }
 parking_lot = { workspace = true }
 http = { workspace = true }
+# Exposes the mTLS private key only at the ServerTlsConfig build site.
+secrecy = { workspace = true }
+# Assert the process crypto provider is installed before building the acceptor
+# (a clean startup error instead of a rustls panic).
+rustls = { workspace = true }
 
-# gRPC server
-tonic = { workspace = true }
+# gRPC server. `tls-aws-lc` adds tonic's rustls server TLS (ServerTlsConfig) on
+# the workspace-standard aws-lc-rs provider so the hub can terminate mTLS. Never
+# pair with a `ring`-backed TLS feature (dual rustls backends panic at runtime;
+# `ring` is FIPS-banned).
+tonic = { workspace = true, features = ["tls-aws-lc"] }
 
 [dev-dependencies]
 tempfile = { workspace = true }
 uuid = { workspace = true }
 bytes = { workspace = true }
-secrecy = { workspace = true }
 tonic = { workspace = true, features = ["transport"] }
+# Real X.509 fixtures (CA + server + client leaf) for the mTLS serve tests.
+rcgen = { workspace = true }

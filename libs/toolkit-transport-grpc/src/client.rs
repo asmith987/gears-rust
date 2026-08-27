@@ -10,13 +10,33 @@
 
 use std::time::Duration;
 
+use secrecy::ExposeSecret;
 use tokio_retry::Retry;
 use tokio_retry::strategy::{ExponentialBackoff, jitter};
-use tonic::transport::{Channel, Endpoint};
+use tonic::transport::{Certificate, Channel, ClientTlsConfig, Endpoint, Identity};
 use tracing::Instrument;
+
+use crate::tls::{TlsGeneration, TlsPaths};
 
 fn duration_to_i64_ms(duration: Duration) -> i64 {
     i64::try_from(duration.as_millis()).unwrap_or(i64::MAX)
+}
+
+/// Client-side mTLS settings for an outbound gRPC channel.
+///
+/// The cert/key/CA are read from the well-known [`TlsPaths`] at connect time
+/// (so a rotation is picked up on the next connect), and `domain_name` is the
+/// name verified against the server certificate's DNS/IP SAN — this is *not*
+/// the SPIFFE URI SAN: rustls verifies DNS/IP names, not URI SANs, so the
+/// server cert must carry a DNS/IP SAN matching the endpoint host (the SPIFFE
+/// URI SAN rides along for identity only). In Profile 3 `domain_name` is the
+/// service DNS name, e.g. `{gear}.{namespace}.svc.cluster.local`.
+#[derive(Debug, Clone)]
+pub struct ClientTlsSettings {
+    /// Well-known cert/key/CA PEM paths.
+    pub paths: TlsPaths,
+    /// The DNS/IP name to verify against the server certificate (and use for SNI).
+    pub domain_name: String,
 }
 
 /// Configuration for gRPC client transport stack.
@@ -66,6 +86,11 @@ pub struct GrpcClientConfig {
 
     /// Enable OpenTelemetry tracing.
     pub enable_tracing: bool,
+
+    /// Client-side mTLS. `None` (the default) builds a plaintext channel — the
+    /// backward-compatible behavior; `Some` makes the channel present a client
+    /// certificate and verify the server against the configured CA.
+    pub tls: Option<ClientTlsSettings>,
 }
 
 impl Default for GrpcClientConfig {
@@ -80,6 +105,7 @@ impl Default for GrpcClientConfig {
             service_name: "grpc_client",
             enable_metrics: true,
             enable_tracing: true,
+            tls: None,
         }
     }
 }
@@ -143,9 +169,20 @@ impl GrpcClientConfig {
         self.enable_tracing = false;
         self
     }
+
+    /// Enable client-side mTLS with material at the given well-known paths,
+    /// verifying the server against `domain_name` (its DNS/IP SAN).
+    pub fn with_tls(mut self, paths: TlsPaths, domain_name: impl Into<String>) -> Self {
+        self.tls = Some(ClientTlsSettings {
+            paths,
+            domain_name: domain_name.into(),
+        });
+        self
+    }
 }
 
-/// Build a tonic `Endpoint` with timeouts and keepalive settings.
+/// Build a tonic `Endpoint` with timeouts, keepalive, and — when
+/// [`GrpcClientConfig::tls`] is set — client mTLS.
 ///
 /// Configures:
 /// - Connect timeout
@@ -154,11 +191,23 @@ impl GrpcClientConfig {
 /// - HTTP/2 keepalive interval (30 seconds)
 /// - Keepalive timeout (10 seconds)
 /// - Keep alive while idle
-fn build_endpoint(
-    uri: String,
-    cfg: &GrpcClientConfig,
-) -> Result<Endpoint, tonic::transport::Error> {
-    let endpoint = Endpoint::from_shared(uri)?
+/// - Client mTLS (present a client cert, verify the server against the CA and
+///   `domain_name`) when `cfg.tls` is `Some`
+///
+/// Async because the mTLS material is read from the well-known paths at build
+/// time, so a rotation is picked up on the next connect. The crypto provider is
+/// the process-installed rustls default (installed by
+/// `toolkit::bootstrap::init_crypto_provider`); tonic builds its `ClientConfig`
+/// through it, so a FIPS build inherits the FIPS provider with no extra wiring.
+///
+/// # Errors
+/// Returns an error if the URI is invalid or the TLS material cannot be read,
+/// validated, or applied.
+async fn build_endpoint(uri: String, cfg: &GrpcClientConfig) -> anyhow::Result<Endpoint> {
+    use anyhow::Context as _;
+
+    let mut endpoint = Endpoint::from_shared(uri)
+        .context("invalid gRPC endpoint URI")?
         .connect_timeout(cfg.connect_timeout)
         .timeout(cfg.rpc_timeout)
         .tcp_keepalive(Some(Duration::from_secs(30)))
@@ -166,7 +215,44 @@ fn build_endpoint(
         .keep_alive_timeout(Duration::from_secs(10))
         .keep_alive_while_idle(true);
 
+    if let Some(tls) = &cfg.tls {
+        let material = TlsGeneration::load(&tls.paths)
+            .await
+            .context("loading client mTLS material")?;
+        let client_tls = ClientTlsConfig::new()
+            .ca_certificate(Certificate::from_pem(material.ca_pem()))
+            .identity(Identity::from_pem(
+                material.cert_pem(),
+                material.key_pem().expose_secret(),
+            ))
+            .domain_name(tls.domain_name.clone());
+        endpoint = endpoint
+            .tls_config(client_tls)
+            .context("applying client mTLS config")?;
+    }
+
     Ok(endpoint)
+}
+
+/// Build a lazily-connecting [`Channel`] with the configured transport stack
+/// (timeouts, keepalive, and optional client mTLS).
+///
+/// This is the framework-owned seam a gear SDK uses to obtain a channel without
+/// touching cert material or owning a `tls_config` of its own: it passes a
+/// [`GrpcClientConfig`] (optionally carrying [`ClientTlsSettings`]) and gets
+/// back a ready channel. `connect_lazy` defers the TCP/TLS handshake to first
+/// use, but the mTLS material is still read here (async) so a bad path fails
+/// fast rather than at first RPC.
+///
+/// # Errors
+/// Returns an error if the URI is invalid or the TLS material cannot be read,
+/// validated, or applied.
+pub async fn build_channel_lazy(
+    uri: impl Into<String>,
+    cfg: &GrpcClientConfig,
+) -> anyhow::Result<Channel> {
+    let endpoint = build_endpoint(uri.into(), cfg).await?;
+    Ok(endpoint.connect_lazy())
 }
 
 /// Connect to a gRPC service with the configured transport stack.
@@ -221,7 +307,7 @@ where
     );
 
     async move {
-        let endpoint = build_endpoint(uri_string, cfg)?;
+        let endpoint = build_endpoint(uri_string, cfg).await?;
         let channel = endpoint.connect().await?;
 
         if cfg.enable_tracing {
@@ -396,20 +482,251 @@ mod tests {
         assert!(!cfg.enable_tracing);
     }
 
-    #[test]
-    fn test_build_endpoint_succeeds() {
+    #[tokio::test]
+    async fn test_build_endpoint_succeeds() {
         let cfg = GrpcClientConfig::default();
-        let result = build_endpoint("http://localhost:50051".to_owned(), &cfg);
+        let result = build_endpoint("http://localhost:50051".to_owned(), &cfg).await;
         assert!(
             result.is_ok(),
             "build_endpoint should succeed with valid URI"
         );
     }
 
-    #[test]
-    fn test_build_endpoint_empty_uri() {
+    #[tokio::test]
+    async fn test_build_endpoint_empty_uri() {
         let cfg = GrpcClientConfig::default();
-        let result = build_endpoint(String::new(), &cfg);
+        let result = build_endpoint(String::new(), &cfg).await;
         assert!(result.is_err(), "build_endpoint should fail with empty URI");
+    }
+
+    #[test]
+    fn with_tls_sets_settings() {
+        let cfg = GrpcClientConfig::new("svc").with_tls(
+            TlsPaths {
+                cert: "/x/tls.crt".into(),
+                key: "/x/tls.key".into(),
+                ca: "/x/ca.crt".into(),
+            },
+            "gear.ns.svc.cluster.local",
+        );
+        let tls = cfg.tls.expect("tls set");
+        assert_eq!(tls.domain_name, "gear.ns.svc.cluster.local");
+        assert_eq!(tls.paths.cert, std::path::PathBuf::from("/x/tls.crt"));
+    }
+
+    #[tokio::test]
+    async fn build_endpoint_with_missing_tls_material_errors() {
+        let cfg = GrpcClientConfig::new("svc").with_tls(
+            TlsPaths {
+                cert: "/nonexistent/tls.crt".into(),
+                key: "/nonexistent/tls.key".into(),
+                ca: "/nonexistent/ca.crt".into(),
+            },
+            "localhost",
+        );
+        let result = build_endpoint("https://localhost:50051".to_owned(), &cfg).await;
+        assert!(
+            result.is_err(),
+            "TLS enabled with unreadable material must fail the build"
+        );
+    }
+
+    // ---- end-to-end mTLS: the client seam against a real tonic TLS server ----
+
+    use rcgen::{CertificateParams, Issuer, KeyPair, SanType};
+    use std::sync::atomic::{AtomicU64, Ordering};
+    use tonic::codec::{Codec, DecodeBuf, Decoder, EncodeBuf, Encoder};
+    use tonic::transport::{Certificate as TCert, Identity as TIdentity, Server, ServerTlsConfig};
+
+    fn unique_dir(tag: &str) -> std::path::PathBuf {
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+        std::env::temp_dir().join(format!("clienttls-{tag}-{}-{n}", std::process::id()))
+    }
+
+    struct Pki {
+        ca_pem: String,
+        server_cert: String,
+        server_key: String,
+        client_cert: String,
+        client_key: String,
+    }
+
+    /// CA + a server leaf (SAN DNS:localhost) + a client leaf, all signed by CA.
+    fn make_pki() -> Pki {
+        let ca_key = KeyPair::generate().unwrap();
+        let ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        let ca_cert = ca_params.self_signed(&ca_key).unwrap();
+        let ca_pem = ca_cert.pem();
+        let issuer = Issuer::new(ca_params, ca_key);
+
+        let leaf = |sans: Vec<SanType>| {
+            let key = KeyPair::generate().unwrap();
+            let mut params = CertificateParams::new(Vec::<String>::new()).unwrap();
+            params.subject_alt_names = sans;
+            let cert = params.signed_by(&key, &issuer).unwrap();
+            (cert.pem(), key.serialize_pem())
+        };
+        let (server_cert, server_key) =
+            leaf(vec![SanType::DnsName("localhost".try_into().unwrap())]);
+        let (client_cert, client_key) =
+            leaf(vec![SanType::DnsName("client.local".try_into().unwrap())]);
+        Pki {
+            ca_pem,
+            server_cert,
+            server_key,
+            client_cert,
+            client_key,
+        }
+    }
+
+    // A no-op `()` codec so we can issue a unary RPC with no .proto codegen; we
+    // only care whether the request traverses the mTLS channel to the server.
+    #[derive(Default)]
+    struct EmptyCodec;
+    struct Noop;
+    impl Codec for EmptyCodec {
+        type Encode = ();
+        type Decode = ();
+        type Encoder = Noop;
+        type Decoder = Noop;
+        fn encoder(&mut self) -> Noop {
+            Noop
+        }
+        fn decoder(&mut self) -> Noop {
+            Noop
+        }
+    }
+    impl Encoder for Noop {
+        type Item = ();
+        type Error = tonic::Status;
+        fn encode(&mut self, _item: (), _dst: &mut EncodeBuf<'_>) -> Result<(), tonic::Status> {
+            Ok(())
+        }
+    }
+    impl Decoder for Noop {
+        type Item = ();
+        type Error = tonic::Status;
+        fn decode(&mut self, _: &mut DecodeBuf<'_>) -> Result<Option<()>, tonic::Status> {
+            Ok(Some(()))
+        }
+    }
+
+    /// Write the client's cert/key/ca to files and return a TLS-enabled config.
+    async fn client_cfg(dir: &std::path::Path, pki: &Pki) -> GrpcClientConfig {
+        tokio::fs::create_dir_all(dir).await.unwrap();
+        let paths = TlsPaths {
+            cert: dir.join("tls.crt"),
+            key: dir.join("tls.key"),
+            ca: dir.join("ca.crt"),
+        };
+        tokio::fs::write(&paths.cert, &pki.client_cert)
+            .await
+            .unwrap();
+        tokio::fs::write(&paths.key, &pki.client_key).await.unwrap();
+        tokio::fs::write(&paths.ca, &pki.ca_pem).await.unwrap();
+        GrpcClientConfig::new("test").with_tls(paths, "localhost")
+    }
+
+    /// Spawn a tonic server terminating mTLS (server identity + client CA) on an
+    /// ephemeral port; returns (addr, shutdown, join).
+    async fn spawn_mtls_server(
+        pki: &Pki,
+    ) -> (
+        std::net::SocketAddr,
+        tokio::sync::oneshot::Sender<()>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        drop(listener);
+        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
+        let server_tls = ServerTlsConfig::new()
+            .identity(TIdentity::from_pem(&pki.server_cert, &pki.server_key))
+            .client_ca_root(TCert::from_pem(&pki.ca_pem));
+        let handle = tokio::spawn(async move {
+            Server::builder()
+                .tls_config(server_tls)
+                .expect("server tls")
+                .add_routes(tonic::service::Routes::default())
+                .serve_with_shutdown(addr, async {
+                    rx.await.ok();
+                })
+                .await
+                .ok();
+        });
+        tokio::time::sleep(Duration::from_millis(150)).await;
+        (addr, tx, handle)
+    }
+
+    /// Issue one unary RPC over `channel`; `true` if it reached the server
+    /// (empty router answers `Unimplemented` — proof the mTLS channel is up).
+    async fn rpc_reaches_server(channel: Channel) -> bool {
+        let mut grpc = tonic::client::Grpc::new(channel);
+        if grpc.ready().await.is_err() {
+            return false;
+        }
+        let path = http::uri::PathAndQuery::from_static("/probe.Svc/Probe");
+        match grpc
+            .unary::<(), (), _>(tonic::Request::new(()), path, EmptyCodec)
+            .await
+        {
+            Ok(_) => true,
+            Err(status) => status.code() == tonic::Code::Unimplemented,
+        }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn mtls_client_reaches_server_through_the_seam() {
+        let pki = make_pki();
+        let (addr, tx, handle) = spawn_mtls_server(&pki).await;
+        let dir = unique_dir("ok");
+        let cfg = client_cfg(&dir, &pki).await;
+
+        let channel = build_channel_lazy(format!("https://localhost:{}", addr.port()), &cfg)
+            .await
+            .expect("channel built");
+        assert!(
+            rpc_reaches_server(channel).await,
+            "an mTLS client built through the seam should reach the server"
+        );
+
+        tx.send(()).ok();
+        handle.await.ok();
+        tokio::fs::remove_dir_all(&dir).await.ok();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn client_rejects_server_signed_by_an_untrusted_ca() {
+        let pki = make_pki();
+        let (addr, tx, handle) = spawn_mtls_server(&pki).await;
+        // Client trusts a DIFFERENT CA than the one that signed the server cert.
+        let other = make_pki();
+        let dir = unique_dir("badca");
+        tokio::fs::create_dir_all(&dir).await.unwrap();
+        let paths = TlsPaths {
+            cert: dir.join("tls.crt"),
+            key: dir.join("tls.key"),
+            ca: dir.join("ca.crt"),
+        };
+        tokio::fs::write(&paths.cert, &pki.client_cert)
+            .await
+            .unwrap();
+        tokio::fs::write(&paths.key, &pki.client_key).await.unwrap();
+        tokio::fs::write(&paths.ca, &other.ca_pem).await.unwrap();
+        let cfg = GrpcClientConfig::new("test").with_tls(paths, "localhost");
+
+        // Server-cert verification is client-side, so it fails at connect().
+        let channel = build_channel_lazy(format!("https://localhost:{}", addr.port()), &cfg)
+            .await
+            .expect("channel builds lazily");
+        assert!(
+            !rpc_reaches_server(channel).await,
+            "a server cert signed by an untrusted CA must be rejected"
+        );
+
+        tx.send(()).ok();
+        handle.await.ok();
+        tokio::fs::remove_dir_all(&dir).await.ok();
     }
 }

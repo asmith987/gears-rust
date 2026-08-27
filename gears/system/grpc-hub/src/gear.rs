@@ -14,8 +14,8 @@ use toolkit::{
 };
 
 use parking_lot::RwLock;
+use secrecy::ExposeSecret;
 use serde::Deserialize;
-#[cfg(unix)]
 use std::path::PathBuf;
 use std::{
     collections::HashSet,
@@ -25,10 +25,15 @@ use std::{
 use tokio::net::TcpListener;
 use tokio_stream::wrappers::TcpListenerStream;
 use tokio_util::sync::CancellationToken;
-use tonic::{service::RoutesBuilder, transport::Server};
+use tonic::{
+    service::RoutesBuilder,
+    transport::{Certificate, Identity, Server, ServerTlsConfig},
+};
 
 use toolkit_security::{DynInternalAuthenticator, InternalAuthConfig};
-use toolkit_transport_grpc::{InternalAuthEnforcement, InternalAuthGrpcLayer};
+use toolkit_transport_grpc::{
+    InternalAuthEnforcement, InternalAuthGrpcLayer, TlsGeneration, TlsPaths,
+};
 
 #[cfg(windows)]
 use toolkit_transport_grpc::create_named_pipe_incoming;
@@ -105,6 +110,15 @@ pub struct GrpcHubConfig {
     /// re-validates). Bounded at boot by [`MAX_INTERNAL_AUTH_CACHE_TTL_SECS`] to
     /// keep the token-revocation window tight.
     pub internal_auth_cache_ttl_secs: u64,
+
+    /// Server-side mTLS for the **TCP** listener. Omit for plaintext h2c (the
+    /// backward-compatible default; Profile 1 / trusted network). When present
+    /// with `mode = "required"` (the default once the block is set), the TCP
+    /// listener terminates mTLS: it presents `cert`/`key` and verifies every
+    /// client certificate against `ca` (the platform CA). UDS / named-pipe
+    /// listeners are unaffected — their trust root is the OS boundary plus
+    /// filesystem permissions (`cpt-cf-adr-platform-plane-auth`).
+    pub tls: Option<GrpcTlsConfig>,
 }
 
 impl Default for GrpcHubConfig {
@@ -116,6 +130,54 @@ impl Default for GrpcHubConfig {
             internal_auth_enforcement: InternalAuthEnforcement::default(),
             internal_auth_exempt_methods: None,
             internal_auth_cache_ttl_secs: DEFAULT_INTERNAL_AUTH_CACHE_TTL_SECS,
+            tls: None,
+        }
+    }
+}
+
+/// How the TCP listener treats TLS when a [`GrpcTlsConfig`] block is present.
+///
+/// A staging switch: an operator can configure the cert paths and flip `mode`
+/// between `disabled` and `required` without editing paths, mirroring the
+/// staged rollout the platform-plane auth work uses.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GrpcTlsMode {
+    /// Serve plaintext h2c even though cert paths are configured (rollout off
+    /// switch).
+    Disabled,
+    /// Terminate mTLS: present the server certificate and require + verify a
+    /// client certificate against the platform CA.
+    #[default]
+    Required,
+}
+
+/// Server-side mTLS material for the TCP listener, keyed off well-known PEM
+/// paths (`cpt-cf-adr-platform-plane-auth`: the runtime consumes rotated certs
+/// from a well-known path). The paths are read and validated when the TCP
+/// listener starts; the private key never appears in this struct, only its
+/// path.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct GrpcTlsConfig {
+    /// `disabled` | `required`. Defaults to `required` when the block is set.
+    #[serde(default)]
+    pub mode: GrpcTlsMode,
+    /// Well-known path to the server leaf certificate chain, PEM (leaf-first).
+    pub cert_path: PathBuf,
+    /// Well-known path to the server private key, PEM.
+    pub key_path: PathBuf,
+    /// Well-known path to the platform CA, PEM (verifies client certificates).
+    pub ca_path: PathBuf,
+}
+
+impl GrpcTlsConfig {
+    /// The well-known PEM paths as a [`TlsPaths`].
+    fn paths(&self) -> TlsPaths {
+        TlsPaths {
+            cert: self.cert_path.clone(),
+            key: self.key_path.clone(),
+            ca: self.ca_path.clone(),
         }
     }
 }
@@ -258,6 +320,11 @@ pub struct GrpcHub {
     /// Platform-plane middleware applied to every served gRPC RPC; a
     /// pass-through layer when `internal_auth` is unset.
     pub(crate) auth_layer: OnceLock<InternalAuthGrpcLayer>,
+    /// Resolved server-mTLS config for the TCP listener, set by `init`. `None`
+    /// when no `tls` block is configured or `mode = disabled` (plaintext);
+    /// `Some` carries the validated paths, loaded into a `ServerTlsConfig` when
+    /// the TCP listener starts.
+    pub(crate) tls_config: OnceLock<Option<GrpcTlsConfig>>,
 }
 
 impl Default for GrpcHub {
@@ -270,6 +337,7 @@ impl Default for GrpcHub {
             instance_id: OnceLock::new(),
             bound_endpoint: RwLock::new(None),
             auth_layer: OnceLock::new(),
+            tls_config: OnceLock::new(),
         }
     }
 }
@@ -331,18 +399,83 @@ impl GrpcHub {
         })
     }
 
+    /// The resolved TCP-listener TLS config; `Ok(None)` means plaintext.
+    ///
+    /// Like [`effective_auth_layer`](Self::effective_auth_layer), an unset value
+    /// means `init` never ran — a startup-ordering bug — so this refuses to
+    /// serve rather than silently downgrading the TLS posture.
+    ///
+    /// # Errors
+    /// Returns an error if `init` has not run.
+    fn effective_tls_config(&self) -> anyhow::Result<Option<&GrpcTlsConfig>> {
+        self.tls_config.get().map(Option::as_ref).ok_or_else(|| {
+            anyhow::anyhow!(
+                "GrpcHub tls_config not initialized: Gear::init must run before serving \
+                 (refusing to serve with TLS posture undetermined)"
+            )
+        })
+    }
+
+    /// Whether the TCP listener terminates TLS. Drives the advertised scheme.
+    fn tls_enabled(&self) -> bool {
+        matches!(self.tls_config.get(), Some(Some(_)))
+    }
+
+    /// The URL scheme the TCP listener advertises: `https` when it terminates
+    /// mTLS, `http` otherwise.
+    fn tcp_scheme(&self) -> &'static str {
+        if self.tls_enabled() { "https" } else { "http" }
+    }
+
+    /// Load and build the TCP listener's [`ServerTlsConfig`] from the validated
+    /// well-known material. `Ok(None)` when TLS is disabled.
+    ///
+    /// The material is loaded once here at serve start; a rotation is picked up
+    /// on the next (re)serve. Live reload without a restart is a follow-up that
+    /// keeps a [`toolkit_transport_grpc::TlsMaterialReader`] alive and re-serves
+    /// on its generation counter (see the platform-plane mTLS plan).
+    ///
+    /// # Errors
+    /// Returns an error if `init` has not run or the material cannot be read or
+    /// validated.
+    async fn build_server_tls(&self) -> anyhow::Result<Option<ServerTlsConfig>> {
+        let Some(tls_cfg) = self.effective_tls_config()? else {
+            return Ok(None);
+        };
+        // tonic builds its rustls `ServerConfig` through the process-default
+        // crypto provider; with both aws-lc-rs and ring unified on rustls in
+        // this workspace there is no compiled-in default, so an uninstalled
+        // provider would make the acceptor build *panic*. Fail with a clear,
+        // actionable error instead (the provider is installed by
+        // `toolkit::bootstrap::init_crypto_provider` before serving).
+        anyhow::ensure!(
+            rustls::crypto::CryptoProvider::get_default().is_some(),
+            "rustls crypto provider is not installed; call \
+             toolkit::bootstrap::init_crypto_provider() before serving gRPC mTLS"
+        );
+        let material = TlsGeneration::load(&tls_cfg.paths())
+            .await
+            .context("loading gRPC hub server mTLS material")?;
+        let identity = Identity::from_pem(material.cert_pem(), material.key_pem().expose_secret());
+        let server_tls = ServerTlsConfig::new()
+            .identity(identity)
+            .client_ca_root(Certificate::from_pem(material.ca_pem()));
+        Ok(Some(server_tls))
+    }
+
     /// Pick the endpoint to register with Directory for a TCP listener.
     ///
     /// Returns `None` when the bound address is unspecified (e.g. `0.0.0.0`)
     /// and no explicit `advertise_addr` is configured — in that case the
     /// endpoint is not routable and registration must be skipped.
     fn tcp_directory_endpoint(&self, bound_addr: SocketAddr) -> Option<String> {
+        let scheme = self.tcp_scheme();
         if let Some((host, port)) = self.advertise_addr.get() {
             let resolved = format!("{}:{}", host, port.unwrap_or(bound_addr.port()));
 
-            Some(format!("http://{resolved}"))
+            Some(format!("{scheme}://{resolved}"))
         } else if !bound_addr.ip().is_unspecified() {
-            Some(format!("http://{bound_addr}"))
+            Some(format!("{scheme}://{bound_addr}"))
         } else {
             None
         }
@@ -579,32 +712,61 @@ impl GrpcHub {
         cancel: CancellationToken,
         ready: ReadySignal,
     ) -> anyhow::Result<()> {
+        // Load the mTLS material (structural PEM validation only at this point).
+        let server_tls = self.build_server_tls().await?;
+
         let listener = TcpListener::bind(addr).await?;
         let bound_addr = listener.local_addr()?;
-        tracing::info!(%bound_addr, transport = "tcp", "gRPC hub listening");
+        let scheme = self.tcp_scheme();
+        tracing::info!(%bound_addr, transport = "tcp", tls = self.tls_enabled(), "gRPC hub listening");
 
-        self.set_bound_endpoint(format!("http://{bound_addr}"));
-
-        if let Some(endpoint) = self.tcp_directory_endpoint(bound_addr) {
-            self.register_gears(gears, &endpoint).await?;
-        } else {
-            tracing::warn!(
-                %bound_addr,
-                "listen_addr is unspecified and no advertise_addr configured; skipping Directory registration"
-            );
+        // Assemble the router — including `tls_config`, which eagerly builds the
+        // rustls acceptor and needs the process crypto provider — *before*
+        // announcing. This way a semantic TLS error (cert/key mismatch,
+        // unsupported algorithm) or a provider-ordering violation fails startup
+        // here, rather than after we have advertised an `https` endpoint to
+        // Directory and signaled readiness. TLS is configured ahead of
+        // `add_routes` (tonic requires that); `None` leaves the listener as
+        // plaintext h2c — the backward-compatible default.
+        let mut builder = Server::builder();
+        if let Some(tls) = server_tls {
+            builder = builder
+                .tls_config(tls)
+                .context("applying gRPC hub server TLS config")?;
         }
+        let serving = builder
+            .layer(self.effective_auth_layer()?)
+            .add_routes(routes);
 
+        self.set_bound_endpoint(format!("{scheme}://{bound_addr}"));
+        self.register_tcp_endpoint(gears, bound_addr).await?;
         ready.notify();
 
         let incoming = TcpListenerStream::new(listener);
-        Server::builder()
-            .layer(self.effective_auth_layer()?)
-            .add_routes(routes)
+        serving
             .serve_with_incoming_shutdown(incoming, async move {
                 cancel.cancelled().await;
             })
             .await?;
         Ok(())
+    }
+
+    /// Register the TCP listener's endpoint with Directory, or log-and-skip when
+    /// the bound address is unroutable and no `advertise_addr` is configured.
+    async fn register_tcp_endpoint(
+        &self,
+        gears: &[GearInstallers],
+        bound_addr: SocketAddr,
+    ) -> anyhow::Result<()> {
+        if let Some(endpoint) = self.tcp_directory_endpoint(bound_addr) {
+            self.register_gears(gears, &endpoint).await
+        } else {
+            tracing::warn!(
+                %bound_addr,
+                "listen_addr is unspecified and no advertise_addr configured; skipping Directory registration"
+            );
+            Ok(())
+        }
     }
 
     /// Serve gRPC over Unix Domain Socket with Directory registration.
@@ -833,6 +995,21 @@ impl Gear for GrpcHub {
             .set(auth_layer)
             .map_err(|_| anyhow::anyhow!("auth_layer already set (init called twice?)"))?;
 
+        // Resolve the TCP-listener TLS posture once here so the serve path and
+        // the advertised scheme share one source of truth. An absent block or
+        // `mode = disabled` collapses to `None` (plaintext); the material itself
+        // is loaded when the TCP listener starts.
+        let tls_config = cfg.tls.filter(|t| t.mode == GrpcTlsMode::Required);
+        if let Some(tls) = &tls_config {
+            tracing::info!(
+                cert = %tls.cert_path.display(),
+                "grpc-hub TCP listener will terminate mTLS (required)"
+            );
+        }
+        self.tls_config
+            .set(tls_config)
+            .map_err(|_| anyhow::anyhow!("tls_config already set (init called twice?)"))?;
+
         if let Some(advertise_addr) = cfg.advertise_addr {
             let parsed = parse_advertise_addr(&advertise_addr)?;
 
@@ -1060,6 +1237,7 @@ mod tests {
         hub.auth_layer
             .set(InternalAuthGrpcLayer::disabled())
             .unwrap();
+        hub.tls_config.set(None).unwrap();
         let data = GrpcInstallerData {
             gears: vec![GearInstallers {
                 gear_name: "test".to_owned(),
@@ -1121,6 +1299,7 @@ mod tests {
         hub.auth_layer
             .set(InternalAuthGrpcLayer::disabled())
             .unwrap();
+        hub.tls_config.set(None).unwrap();
 
         let cancel = CancellationToken::new();
         let cancel_clone = cancel.clone();
@@ -1741,5 +1920,153 @@ mod tests {
             .await
             .expect("task should join")
             .expect("server should exit cleanly");
+    }
+
+    // ---- W2: server mTLS config parsing + serve wiring ----
+
+    #[test]
+    fn tls_block_parses_as_required_by_default() {
+        let cfg: GrpcHubConfig = serde_json::from_value(serde_json::json!({
+            "tls": { "cert_path": "/x/tls.crt", "key_path": "/x/tls.key", "ca_path": "/x/ca.crt" }
+        }))
+        .expect("tls block should deserialize");
+        let tls = cfg.tls.expect("tls present");
+        assert_eq!(tls.mode, GrpcTlsMode::Required);
+        assert_eq!(tls.cert_path, PathBuf::from("/x/tls.crt"));
+    }
+
+    #[test]
+    fn tls_mode_disabled_parses() {
+        let cfg: GrpcHubConfig = serde_json::from_value(serde_json::json!({
+            "tls": {
+                "mode": "disabled",
+                "cert_path": "/x/tls.crt", "key_path": "/x/tls.key", "ca_path": "/x/ca.crt"
+            }
+        }))
+        .expect("tls block should deserialize");
+        assert_eq!(cfg.tls.expect("tls present").mode, GrpcTlsMode::Disabled);
+    }
+
+    #[test]
+    fn omitted_tls_is_none() {
+        let cfg: GrpcHubConfig =
+            serde_json::from_value(serde_json::json!({})).expect("empty config");
+        assert!(
+            cfg.tls.is_none(),
+            "absent tls block must be None (plaintext)"
+        );
+    }
+
+    /// Writes a CA + server leaf (cert+key) into `dir` via rcgen; returns the
+    /// (cert, key, ca) paths.
+    fn write_server_tls_fixture(dir: &std::path::Path) -> (PathBuf, PathBuf, PathBuf) {
+        use rcgen::{BasicConstraints, CertificateParams, IsCa, KeyPair};
+        std::fs::create_dir_all(dir).unwrap();
+        let ca_key = KeyPair::generate().unwrap();
+        let mut ca_params = CertificateParams::new(Vec::<String>::new()).unwrap();
+        ca_params.is_ca = IsCa::Ca(BasicConstraints::Unconstrained);
+        let ca = ca_params.self_signed(&ca_key).unwrap();
+        let leaf_key = KeyPair::generate().unwrap();
+        let leaf_params = CertificateParams::new(vec!["localhost".to_owned()]).unwrap();
+        let issuer = rcgen::Issuer::new(ca_params, ca_key);
+        let leaf = leaf_params.signed_by(&leaf_key, &issuer).unwrap();
+        let (cert_p, key_p, ca_p) = (dir.join("tls.crt"), dir.join("tls.key"), dir.join("ca.crt"));
+        std::fs::write(&cert_p, leaf.pem()).unwrap();
+        std::fs::write(&key_p, leaf_key.serialize_pem()).unwrap();
+        std::fs::write(&ca_p, ca.pem()).unwrap();
+        (cert_p, key_p, ca_p)
+    }
+
+    #[tokio::test]
+    async fn build_server_tls_from_valid_fixture() {
+        // `build_server_tls` asserts a rustls provider is installed (matches the
+        // runtime, where bootstrap installs it); do the same for the test.
+        rustls::crypto::aws_lc_rs::default_provider()
+            .install_default()
+            .ok();
+        let dir =
+            std::env::temp_dir().join(format!("hubtls-{}-{}", std::process::id(), Uuid::new_v4()));
+        let (cert_path, key_path, ca_path) = write_server_tls_fixture(&dir);
+        let hub = GrpcHub::default();
+        hub.tls_config
+            .set(Some(GrpcTlsConfig {
+                mode: GrpcTlsMode::Required,
+                cert_path,
+                key_path,
+                ca_path,
+            }))
+            .unwrap();
+
+        assert!(hub.tls_enabled());
+        assert_eq!(hub.tcp_scheme(), "https");
+        assert!(
+            hub.build_server_tls().await.expect("build ok").is_some(),
+            "required TLS must build a ServerTlsConfig from valid material"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn build_server_tls_is_none_when_disabled() {
+        let hub = GrpcHub::default();
+        hub.tls_config.set(None).unwrap();
+        assert!(!hub.tls_enabled());
+        assert_eq!(hub.tcp_scheme(), "http");
+        assert!(hub.build_server_tls().await.expect("ok").is_none());
+    }
+
+    #[tokio::test]
+    async fn build_server_tls_errors_on_missing_material() {
+        let hub = GrpcHub::default();
+        hub.tls_config
+            .set(Some(GrpcTlsConfig {
+                mode: GrpcTlsMode::Required,
+                cert_path: PathBuf::from("/nonexistent/tls.crt"),
+                key_path: PathBuf::from("/nonexistent/tls.key"),
+                ca_path: PathBuf::from("/nonexistent/ca.crt"),
+            }))
+            .unwrap();
+        assert!(
+            hub.build_server_tls().await.is_err(),
+            "missing material must fail the serve-time build, not serve plaintext"
+        );
+    }
+
+    #[tokio::test]
+    async fn init_resolves_required_tls_to_https() {
+        let hub = GrpcHub::default();
+        let ctx = GearCtx::new(
+            "grpc-hub",
+            Uuid::new_v4(),
+            Arc::new(config_provider_with(serde_json::json!({
+                "tls": { "cert_path": "/x/tls.crt", "key_path": "/x/tls.key", "ca_path": "/x/ca.crt" }
+            }))),
+            Arc::new(ClientHub::default()),
+            CancellationToken::new(),
+        );
+        hub.init(&ctx).await.expect("init ok");
+        assert!(hub.tls_enabled(), "required tls must resolve to enabled");
+        assert_eq!(hub.tcp_scheme(), "https");
+    }
+
+    #[tokio::test]
+    async fn init_resolves_disabled_tls_to_plaintext() {
+        let hub = GrpcHub::default();
+        let ctx = GearCtx::new(
+            "grpc-hub",
+            Uuid::new_v4(),
+            Arc::new(config_provider_with(serde_json::json!({
+                "tls": {
+                    "mode": "disabled",
+                    "cert_path": "/x/tls.crt", "key_path": "/x/tls.key", "ca_path": "/x/ca.crt"
+                }
+            }))),
+            Arc::new(ClientHub::default()),
+            CancellationToken::new(),
+        );
+        hub.init(&ctx).await.expect("init ok");
+        assert!(!hub.tls_enabled(), "disabled tls must resolve to plaintext");
+        assert_eq!(hub.tcp_scheme(), "http");
     }
 }

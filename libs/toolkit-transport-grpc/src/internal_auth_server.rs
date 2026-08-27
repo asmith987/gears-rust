@@ -44,12 +44,14 @@ use std::sync::Arc;
 use std::task::{Context, Poll};
 
 use futures_util::future::Either;
+use rustls_pki_types::CertificateDer;
 use secrecy::{ExposeSecret, SecretString};
 use tonic::Status;
+use tonic::transport::server::{TcpConnectInfo, TlsConnectInfo};
 use toolkit_security::constants::INTERNAL_TOKEN_HEADER;
 use toolkit_security::{
     DynInternalAuthenticator, InternalAuthNError, InternalAuthenticator, PeerAuthenticated,
-    PlatformSecurityContext,
+    PlatformIdentity, PlatformSecurityContext,
 };
 use tower::{Layer, Service};
 
@@ -274,6 +276,81 @@ fn prefix_matches_boundary(path: &str, prefix: &str) -> bool {
     prefix.ends_with('/') || rest.is_empty() || rest.starts_with('/')
 }
 
+/// Parse a SPIFFE ID of the platform shape
+/// `spiffe://<trust_domain>/gear/<name>/<version>` into its three components.
+///
+/// Returns `None` for any URI that is not exactly that shape (wrong scheme,
+/// empty trust domain, missing `gear` segment, missing/empty name or version,
+/// or trailing segments) — a strict parse so a malformed SAN cannot be coerced
+/// into a partial identity.
+fn parse_spiffe_uri(uri: &str) -> Option<(String, String, String)> {
+    let rest = uri.strip_prefix("spiffe://")?;
+    // A canonical SPIFFE ID carries no query or fragment component.
+    if rest.contains('?') || rest.contains('#') {
+        return None;
+    }
+    let (trust_domain, path) = rest.split_once('/')?;
+    // The trust domain is a bare authority: no userinfo (`@`) and no port (`:`).
+    if trust_domain.is_empty() || trust_domain.contains('@') || trust_domain.contains(':') {
+        return None;
+    }
+    let mut segments = path.split('/');
+    if segments.next()? != "gear" {
+        return None;
+    }
+    let name = segments.next().filter(|s| !s.is_empty())?;
+    let version = segments.next().filter(|s| !s.is_empty())?;
+    if segments.next().is_some() {
+        // Exactly `gear/<name>/<version>` — reject anything longer.
+        return None;
+    }
+    Some((trust_domain.to_owned(), name.to_owned(), version.to_owned()))
+}
+
+/// Build a [`PlatformIdentity::Spiffe`] from a leaf certificate's URI SAN, if it
+/// carries a well-formed platform SPIFFE ID.
+///
+/// The certificate chain has already been verified against the platform CA by
+/// the TLS handshake; this only *reads the identity* out of the (trusted) leaf.
+/// Returns `None` when the leaf has no parseable `spiffe://…/gear/…` URI SAN.
+fn spiffe_identity_from_leaf(der: &CertificateDer<'_>) -> Option<PlatformIdentity> {
+    use x509_parser::extensions::GeneralName;
+
+    let (_, cert) = x509_parser::parse_x509_certificate(der.as_ref()).ok()?;
+    let san = cert.subject_alternative_name().ok()??;
+    let mut found: Option<PlatformIdentity> = None;
+    for general_name in &san.value.general_names {
+        if let GeneralName::URI(uri) = general_name
+            && let Some((trust_domain, name, version)) = parse_spiffe_uri(uri)
+        {
+            if found.is_some() {
+                // More than one parseable platform SPIFFE URI SAN: the identity
+                // is ambiguous, so fail closed rather than silently pick one.
+                tracing::warn!(
+                    "client certificate presents multiple SPIFFE identities; rejecting as ambiguous"
+                );
+                return None;
+            }
+            found = Some(PlatformIdentity::Spiffe {
+                trust_domain,
+                name,
+                version,
+            });
+        }
+    }
+    found
+}
+
+/// The leaf (first) peer certificate of an inbound mTLS connection, if the
+/// request carries tonic's [`TlsConnectInfo`] with a verified client chain.
+///
+/// Absent for a plaintext connection, or a TLS connection where the client
+/// presented no certificate.
+fn peer_leaf_cert<B>(req: &http::Request<B>) -> Option<CertificateDer<'static>> {
+    let info = req.extensions().get::<TlsConnectInfo<TcpConnectInfo>>()?;
+    info.peer_certs()?.first().cloned()
+}
+
 impl<S, ReqBody, ResBody> Service<http::Request<ReqBody>> for InternalAuthGrpcService<S>
 where
     S: Service<http::Request<ReqBody>, Response = http::Response<ResBody>> + Clone + Send + 'static,
@@ -305,12 +382,10 @@ where
         let clone = self.inner.clone();
         let mut inner = std::mem::replace(&mut self.inner, clone);
 
-        // Disabled layer (Profile 1 / in-process): straight pass-through.
-        let AuthMode::Enforced(authenticator) = &self.config.mode else {
-            return Either::Left(inner.call(req));
-        };
-
-        // Infrastructure methods (health, reflection) bypass enforcement.
+        // Infrastructure methods (health, reflection) bypass *everything* —
+        // including mTLS identity resolution — so an unauthenticated probe (or a
+        // probe over a connection whose client cert lacks a SPIFFE identity) is
+        // never rejected. Checked first, on the borrowed path (no allocation).
         let path = req.uri().path();
         if self
             .config
@@ -320,10 +395,60 @@ where
         {
             return Either::Left(inner.call(req));
         }
+        // Own the path so the request can be mutated below without a borrow conflict.
+        let path = path.to_owned();
+
+        // A verified client certificate is authoritative in *every* mode. mTLS
+        // identity resolution is deliberately independent of token enforcement:
+        // whether the token layer is Enforced, Permissive, or Disabled, an
+        // mTLS-authenticated peer always gets its `PlatformSecurityContext`
+        // stamped, and the per-request token degrades to a shim (never a second
+        // gate that could reject an already-authenticated peer). Resolving this
+        // *before* the enforcement branch is what stops an mTLS + disabled-token
+        // deployment from silently dropping the caller identity. This is the
+        // mTLS end-state identity backend of `cpt-cf-adr-platform-plane-auth`;
+        // the token path below serves non-mTLS (SA-token phase) connections.
+        if let Some(leaf) = peer_leaf_cert(&req) {
+            if let Some(identity) = spiffe_identity_from_leaf(&leaf) {
+                // Cert is authoritative — strip any token so the handler never
+                // sees it, and stamp the same context the token path would
+                // (downstream cannot tell which backend produced it).
+                req.headers_mut().remove(INTERNAL_TOKEN_HEADER);
+                let name = identity.peer_name().to_owned();
+                tracing::debug!(
+                    peer = %name,
+                    method = %path,
+                    "platform-plane gRPC call authenticated via mTLS"
+                );
+                req.extensions_mut().insert(PeerAuthenticated { name });
+                req.extensions_mut()
+                    .insert(PlatformSecurityContext::new(identity));
+                return Either::Left(inner.call(req));
+            }
+            // A CA-verified cert with no SPIFFE identity is a misconfiguration
+            // (the platform CA should only sign SPIFFE workload certs); fail
+            // closed rather than fall back to the token path.
+            tracing::warn!(
+                method = %path,
+                "platform-plane gRPC call rejected: client certificate has no SPIFFE identity"
+            );
+            return Either::Right(Box::pin(async move {
+                Ok(
+                    Status::unauthenticated("client certificate has no SPIFFE identity")
+                        .into_http(),
+                )
+            }));
+        }
+
+        // No client certificate — fall back to token-based platform-plane auth.
+        // A disabled layer (Profile 1 / in-process: the process boundary is the
+        // trust root) passes such non-mTLS requests through untouched.
+        let AuthMode::Enforced(authenticator) = &self.config.mode else {
+            return Either::Left(inner.call(req));
+        };
 
         let config = Arc::clone(&self.config);
         let authenticator = authenticator.clone();
-        let path = path.to_owned();
 
         Either::Right(Box::pin(async move {
             match read_token(req.headers_mut()) {
@@ -682,5 +807,89 @@ mod tests {
             "/pkg.Svc/List/sub",
             "/pkg.Svc/List"
         ));
+    }
+
+    // ---- W4: SPIFFE identity extraction from a verified client cert ----
+
+    #[test]
+    fn parse_spiffe_uri_accepts_platform_shape() {
+        assert_eq!(
+            parse_spiffe_uri("spiffe://example.org/gear/cluster/v1"),
+            Some((
+                "example.org".to_owned(),
+                "cluster".to_owned(),
+                "v1".to_owned()
+            ))
+        );
+    }
+
+    #[test]
+    fn parse_spiffe_uri_rejects_malformed() {
+        for bad in [
+            "https://example.org/gear/cluster/v1",        // wrong scheme
+            "spiffe:///gear/cluster/v1",                  // empty trust domain
+            "spiffe://example.org/svc/cluster/v1",        // not `gear`
+            "spiffe://example.org/gear/cluster",          // missing version
+            "spiffe://example.org/gear//v1",              // empty name
+            "spiffe://example.org/gear/cluster/v1/extra", // trailing segment
+            "spiffe://user@example.org/gear/cluster/v1",  // userinfo in authority
+            "spiffe://example.org:8443/gear/cluster/v1",  // port in authority
+            "spiffe://example.org/gear/cluster/v1?x=1",   // query component
+            "spiffe://example.org/gear/cluster/v1#frag",  // fragment component
+        ] {
+            assert!(parse_spiffe_uri(bad).is_none(), "must reject {bad}");
+        }
+    }
+
+    fn leaf_der_with_sans(sans: Vec<rcgen::SanType>) -> rustls_pki_types::CertificateDer<'static> {
+        let key = rcgen::KeyPair::generate().unwrap();
+        let mut params = rcgen::CertificateParams::new(Vec::<String>::new()).unwrap();
+        params.subject_alt_names = sans;
+        let cert = params.self_signed(&key).unwrap();
+        cert.der().clone()
+    }
+
+    #[test]
+    fn spiffe_identity_from_leaf_reads_uri_san() {
+        let der = leaf_der_with_sans(vec![
+            rcgen::SanType::URI("spiffe://td/gear/foo/v2".try_into().unwrap()),
+            rcgen::SanType::DnsName("foo.ns.svc".try_into().unwrap()),
+        ]);
+        match spiffe_identity_from_leaf(&der) {
+            Some(PlatformIdentity::Spiffe {
+                trust_domain,
+                name,
+                version,
+            }) => {
+                assert_eq!(trust_domain, "td");
+                assert_eq!(name, "foo");
+                assert_eq!(version, "v2");
+            }
+            _ => panic!("expected Spiffe identity"),
+        }
+    }
+
+    #[test]
+    fn spiffe_identity_from_leaf_is_none_without_uri_san() {
+        // A cert that verifies against the CA but carries only a DNS SAN has no
+        // SPIFFE identity — the caller (the layer) fails such a peer closed.
+        let der = leaf_der_with_sans(vec![rcgen::SanType::DnsName(
+            "foo.ns.svc".try_into().unwrap(),
+        )]);
+        assert!(spiffe_identity_from_leaf(&der).is_none());
+    }
+
+    #[test]
+    fn spiffe_identity_from_leaf_rejects_ambiguous_multiple_sans() {
+        // Two parseable platform SPIFFE URI SANs ⇒ ambiguous identity ⇒ reject
+        // (fail closed) rather than silently pick the first.
+        let der = leaf_der_with_sans(vec![
+            rcgen::SanType::URI("spiffe://td/gear/foo/v1".try_into().unwrap()),
+            rcgen::SanType::URI("spiffe://td/gear/bar/v1".try_into().unwrap()),
+        ]);
+        assert!(
+            spiffe_identity_from_leaf(&der).is_none(),
+            "a cert with multiple SPIFFE identities must be rejected as ambiguous"
+        );
     }
 }

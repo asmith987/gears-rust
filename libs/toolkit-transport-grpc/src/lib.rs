@@ -4,6 +4,7 @@ pub mod internal_auth;
 pub mod internal_auth_server;
 pub mod rpc_retry;
 pub mod sa_token;
+pub mod tls;
 
 #[cfg(windows)]
 pub mod windows_named_pipe;
@@ -20,6 +21,9 @@ pub use internal_auth_server::{
     InternalAuthGrpcService,
 };
 pub use sa_token::{DEFAULT_REFRESH_INTERVAL, ServiceAccountTokenReader};
+pub use tls::{
+    DEFAULT_TLS_REFRESH_INTERVAL, TlsGeneration, TlsMaterialError, TlsMaterialReader, TlsPaths,
+};
 
 pub const SECCTX_METADATA_KEY: &str = "x-secctx-bin";
 

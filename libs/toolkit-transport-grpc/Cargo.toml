@@ -19,7 +19,13 @@ name = "toolkit_transport_grpc"
 workspace = true
 
 [dependencies]
-tonic = { workspace = true }
+# `tls-aws-lc` adds tonic's rustls TLS surface (ServerTlsConfig / ClientTlsConfig)
+# on the workspace-standard aws-lc-rs provider. It transitively enables
+# `_tls-any` → `tls-connect-info`, so `TlsConnectInfo::peer_certs()` is available
+# for SPIFFE identity extraction. Do NOT add a `ring`-backed TLS feature: two
+# active rustls crypto backends make provider auto-detection panic at runtime,
+# and `ring` is FIPS-banned.
+tonic = { workspace = true, features = ["tls-aws-lc"] }
 toolkit-security = { workspace = true }
 
 futures-util = { workspace = true }
@@ -37,6 +43,13 @@ secrecy = { workspace = true }
 parking_lot = { workspace = true }
 tower = { workspace = true }
 http = { workspace = true }
+# mTLS material: atomically-swappable cert generation + PEM validation at load.
+arc-swap = { workspace = true }
+rustls-pki-types = { workspace = true }
+# Parse the SPIFFE URI SAN out of a verified client certificate (inbound mTLS).
+x509-parser = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt"] }
+# Generates real X.509 fixtures (CA + leaf) for the TLS-material tests.
+rcgen = { workspace = true }
