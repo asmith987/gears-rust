@@ -1796,17 +1796,23 @@ version = "0.1.38"
 dependencies = [
  "anyhow",
  "async-trait",
+ "axum",
  "cf-gears-authz-resolver-sdk",
  "cf-gears-toolkit",
  "cf-gears-toolkit-canonical-errors",
+ "cf-gears-toolkit-contract",
  "cf-gears-toolkit-macros",
+ "cf-gears-toolkit-security",
  "cf-gears-types-registry",
  "cf-gears-types-registry-sdk",
  "inventory",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "tokio",
+ "tokio-util",
  "tracing",
+ "uuid",
 ]
 
 [[package]]
@@ -1814,11 +1820,16 @@ name = "cf-gears-authz-resolver-sdk"
 version = "0.3.22"
 dependencies = [
  "async-trait",
+ "axum",
  "cf-gears-tenant-resolver-sdk",
  "cf-gears-toolkit",
+ "cf-gears-toolkit-canonical-errors",
+ "cf-gears-toolkit-contract",
  "cf-gears-toolkit-gts",
+ "cf-gears-toolkit-http",
  "cf-gears-toolkit-security",
  "gts",
+ "http",
  "schemars 1.2.1",
  "secrecy",
  "serde",
@@ -1826,6 +1837,7 @@ dependencies = [
  "thiserror 2.0.18",
  "tokio",
  "tracing",
+ "utoipa",
  "uuid",
 ]
 
@@ -3193,6 +3205,7 @@ dependencies = [
  "serde",
  "serde_json",
  "thiserror 2.0.18",
+ "utoipa",
  "uuid",
 ]
 

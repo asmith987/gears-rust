@@ -18,12 +18,14 @@ use async_trait::async_trait;
 use uuid::Uuid;
 
 use authz_resolver_sdk::{
-    AuthZResolverClient, AuthZResolverError, EvaluationRequest, EvaluationResponse,
-    EvaluationResponseContext, PolicyEnforcer,
+    AuthZResolverApi, EvaluationRequest, EvaluationResponse, EvaluationResponseContext,
+    PolicyEnforcer,
     constraints::{Constraint, InGroupPredicate, InPredicate, Predicate},
 };
+use toolkit::api::canonical_prelude::CanonicalError;
 use toolkit_db::{DBProvider, DbError};
 use toolkit_odata::ODataQuery;
+use toolkit_security::SecurityContext;
 use toolkit_security::pep_properties;
 
 use resource_group::domain::group_service::{GroupService, QueryProfile};
@@ -39,11 +41,12 @@ use common::{make_ctx, test_db};
 struct TenantScopingAuthZ;
 
 #[async_trait]
-impl AuthZResolverClient for TenantScopingAuthZ {
+impl AuthZResolverApi for TenantScopingAuthZ {
     async fn evaluate(
         &self,
+        _ctx: SecurityContext,
         request: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
+    ) -> Result<EvaluationResponse, CanonicalError> {
         let tenant_id = request
             .subject
             .properties
@@ -77,7 +80,7 @@ impl AuthZResolverClient for TenantScopingAuthZ {
 fn make_group_service(
     db: Arc<DBProvider<DbError>>,
 ) -> GroupService<GroupRepository, TypeRepository> {
-    let authz: Arc<dyn AuthZResolverClient> = Arc::new(TenantScopingAuthZ);
+    let authz: Arc<dyn AuthZResolverApi> = Arc::new(TenantScopingAuthZ);
     let enforcer = PolicyEnforcer::new(authz);
     GroupService::new(
         db,
@@ -393,11 +396,12 @@ struct GroupScopingAuthZ {
 }
 
 #[async_trait]
-impl AuthZResolverClient for GroupScopingAuthZ {
+impl AuthZResolverApi for GroupScopingAuthZ {
     async fn evaluate(
         &self,
+        _ctx: SecurityContext,
         request: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
+    ) -> Result<EvaluationResponse, CanonicalError> {
         let tenant_id = request
             .subject
             .properties
@@ -438,7 +442,7 @@ async fn group_based_in_group_predicate_produces_combined_scope() {
     let group_b = Uuid::now_v7();
     let tenant_id = Uuid::now_v7();
 
-    let authz: Arc<dyn AuthZResolverClient> = Arc::new(GroupScopingAuthZ {
+    let authz: Arc<dyn AuthZResolverApi> = Arc::new(GroupScopingAuthZ {
         allowed_group_ids: vec![group_a, group_b],
     });
     let enforcer = PolicyEnforcer::new(authz);
@@ -554,7 +558,7 @@ async fn group_based_membership_data_correctly_stored() {
         .expect("create ProjectB");
 
     // Add memberships via MembershipService (with PolicyEnforcer)
-    let authz: Arc<dyn AuthZResolverClient> = Arc::new(TenantScopingAuthZ);
+    let authz: Arc<dyn AuthZResolverApi> = Arc::new(TenantScopingAuthZ);
     let enforcer = PolicyEnforcer::new(authz);
     let membership_svc = resource_group::domain::membership_service::MembershipService::new(
         db.clone(),

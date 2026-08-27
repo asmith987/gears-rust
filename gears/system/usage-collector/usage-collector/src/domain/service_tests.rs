@@ -2186,10 +2186,12 @@ mod pdp_dedup_tests {
     #[tokio::test]
     async fn create_usage_records_projects_pdp_deny_across_shared_tuple_groups() {
         use async_trait::async_trait;
+        use authz_resolver_sdk::AuthZResolverApi;
         use authz_resolver_sdk::models::{
             DenyReason, EvaluationRequest, EvaluationResponse, EvaluationResponseContext,
         };
-        use authz_resolver_sdk::{AuthZResolverClient, AuthZResolverError};
+        use toolkit::api::canonical_prelude::CanonicalError;
+        use toolkit_security::SecurityContext;
 
         use crate::domain::authz::usage_record::PROP_RESOURCE_ID;
         use crate::domain::service::Service;
@@ -2205,11 +2207,12 @@ mod pdp_dedup_tests {
         }
 
         #[async_trait]
-        impl AuthZResolverClient for DenyOneResourceResolver {
+        impl AuthZResolverApi for DenyOneResourceResolver {
             async fn evaluate(
                 &self,
+                _ctx: SecurityContext,
                 request: EvaluationRequest,
-            ) -> Result<EvaluationResponse, AuthZResolverError> {
+            ) -> Result<EvaluationResponse, CanonicalError> {
                 let matches_deny = request
                     .resource
                     .properties
