@@ -1,0 +1,35 @@
+# Local multi-process platform-host: cluster-consumer OoP gear.
+#
+# Run (after the host + cluster gear are up):
+#   POD_NAMESPACE=platform-test \
+#   TOOLKIT_DIRECTORY_ENDPOINT=http://127.0.0.1:50051 \
+#     cargo run -p cluster-consumer --features oop_module --bin cluster-consumer-oop \
+#       -- --config config/oop-cluster-consumer.yaml
+#
+# Then:
+#   curl -X POST http://127.0.0.1:8087/cluster-consumer/v1/roundtrip \
+#        -H 'Content-Type: application/json' -d '{"key":"seat/12","value":"held"}'
+#
+# POD_NAMESPACE is what cluster_sdk::wiring uses to derive the cluster gRPC
+# endpoint (cluster.{POD_NAMESPACE}.svc.cluster.local:50051). On loopback that
+# name does not resolve, so the round-trip returns a typed ConnectionLost (503) —
+# the seam proof. In Kubernetes the downward API supplies POD_NAMESPACE and the
+# DNS name resolves, so the round-trip succeeds.
+
+server:
+  home_dir: "~/.cf-gears-cluster-consumer"
+
+logging:
+  default:
+    console_level: info
+    file: "logs/oop-cluster-consumer.log"
+    file_level: info
+
+oop_http:
+  listen_addr: "127.0.0.1:9093"
+  advertise_uri: "http://127.0.0.1:9093"
+  allow_loopback_advertise: true
+
+gears:
+  cluster-consumer:
+    config: {}

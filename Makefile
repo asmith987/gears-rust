@@ -998,6 +998,8 @@ e2e-oop: py-env
 	cargo build -p hello --features oop_module --bin hello-oop
 	cargo build -p cf-api-contracts --features oop_module --bin api-contracts-oop
 	cargo build -p cf-api-contracts-consumer --features oop_module --bin api-contracts-consumer-oop
+	cargo build -p cf-gears-cluster --bin cluster-oop
+	cargo build -p cluster-consumer --features oop_module --bin cluster-consumer-oop
 	$(PYTHON) -m pytest $(OOP_E2E_DIR) -c testing/e2e/pytest.ini \
 		-o timeout_func_only=true --timeout=$(OOP_E2E_TIMEOUT) -vv
 

@@ -68,6 +68,10 @@ GEARS = [
         package="cf-api-contracts-consumer",
         features="oop_module",
     ),
+    # cluster gear (standalone backend) + a gear that consumes its cache over
+    # gRPC. The cluster-oop bin is not feature-gated (no required-features).
+    Binary(name="cluster-oop", package="cf-gears-cluster", features=""),
+    Binary(name="cluster-consumer-oop", package="cluster-consumer", features="oop_module"),
 ]
 
 # Launch specs: (binary name, config path, is_host).
@@ -76,7 +80,16 @@ GEAR_LAUNCH = [
     ("hello-oop", "config/oop-hello.yaml"),
     ("api-contracts-oop", "config/oop-api-contracts.yaml"),
     ("api-contracts-consumer-oop", "config/oop-api-contracts-consumer.yaml"),
+    ("cluster-oop", "config/oop-cluster.yaml"),
+    ("cluster-consumer-oop", "config/oop-cluster-consumer.yaml"),
 ]
+
+# The namespace the cluster consumer derives its cluster gRPC endpoint from
+# (cluster.{POD_NAMESPACE}.svc.cluster.local:50051, see cluster_sdk::wiring). A
+# deployed pod gets it from the downward API; on loopback it must be set for the
+# wiring to build a (deliberately unresolvable) channel — which is what makes the
+# gRPC seam observable as a typed ConnectionLost rather than a wiring error.
+POD_NAMESPACE = os.environ.get("POD_NAMESPACE", "platform-test")
 
 
 # ── helpers ────────────────────────────────────────────────────────────────
@@ -113,6 +126,8 @@ def _launch(bin_name: str, config: str, *, is_host: bool, child_home: str) -> Pr
     # throwaway HOME so runs are repeatable and the real home stays clean.
     env = {**os.environ, "HOME": child_home, "RUST_LOG": os.environ.get("RUST_LOG", "info")}
     env["TOOLKIT_DIRECTORY_ENDPOINT"] = DIRECTORY_ENDPOINT
+    # Harmless for the other processes; required by the cluster consumer's wiring.
+    env["POD_NAMESPACE"] = POD_NAMESPACE
     cmd = [str(TARGET_DIR / bin_name), "--config", config]
     if is_host:
         cmd.append("run")  # the host binary uses a `run` subcommand
@@ -206,6 +221,15 @@ def oop_cluster(tmp_path_factory):
                 "/api-contracts-consumer/v1/charge",
                 json={"amount_cents": 1, "currency": "USD", "description": "warmup"},
             ) == 401,
+            timeout=ROUTE_SYNC_TIMEOUT,
+            procs=procs,
+        )
+        _poll(
+            "cluster-consumer route synced at edge",
+            # The cluster-free ping returns 200 once the route exists (404 before
+            # sync). Deliberately NOT the round-trip route: that call blocks ~8s
+            # when cluster is unreachable and would exceed the probe timeout.
+            lambda: _status("GET", "/cluster-consumer/v1/ping") == 200,
             timeout=ROUTE_SYNC_TIMEOUT,
             procs=procs,
         )
