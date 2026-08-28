@@ -145,3 +145,11 @@ config:
               cache:
                 provider: postgres
                 connection_string: "postgres://{{ .Values.postgres.user }}:{{ .Values.postgres.password }}@{{ .Values.postgres.host }}:5432/{{ .Values.postgres.database }}"
+              # Native Postgres distributed lock (pg_advisory_lock + the
+              # `cluster_lock` table). Declaring it explicitly uses
+              # `PostgresLockProvider` instead of the SDK CAS-over-cache default.
+              lock:
+                provider: postgres
+                connection_string: "postgres://{{ .Values.postgres.user }}:{{ .Values.postgres.password }}@{{ .Values.postgres.host }}:5432/{{ .Values.postgres.database }}"
+              # leader_election is omitted: no native provider exists, so it uses
+              # the SDK CAS-based default layered over the postgres cache above.
