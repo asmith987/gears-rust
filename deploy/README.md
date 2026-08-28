@@ -217,14 +217,14 @@ All external traffic enters through the api-gateway edge, exposed by the
 `/etc/hosts` via `curl --resolve`:
 
 > **macOS + `--driver=docker`:** `minikube ip` (e.g. `192.168.49.2`) is not
-> routable from the host, so the `--resolve` curls below (and `oop-smoke.sh`'s
-> smoke stage) will time out on `/healthz`. Either run `minikube tunnel` in a
-> separate terminal (ingress then answers at `127.0.0.1`, so use
-> `--resolve platform-host.local:80:127.0.0.1`), or skip the ingress entirely and
-> port-forward the edge:
+> routable from the host, so the manual `--resolve` curls below will hang. Either
+> run `minikube tunnel` in a separate terminal (the ingress then answers at
+> `127.0.0.1`, so use `--resolve platform-host.local:80:127.0.0.1`), or skip the
+> ingress and port-forward the edge:
 > `kubectl -n cf-gears port-forward svc/platform-host 8087:8087`, then
-> `curl http://127.0.0.1:8087/...`. On Linux / VM drivers the `minikube ip` path
-> works as written.
+> `curl http://127.0.0.1:8087/...`. **`oop-smoke.sh` handles this automatically**
+> — it probes the Ingress and falls back to a port-forward when the node IP is not
+> reachable, so `--all` passes clean on every driver.
 
 ```bash
 MIP=$(minikube ip)

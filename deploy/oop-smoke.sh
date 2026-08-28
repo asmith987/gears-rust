@@ -43,6 +43,9 @@ RELEASE="${RELEASE:-platform}"
 IMAGE_TAG="${IMAGE_TAG:-dev}"
 REGISTRY="${REGISTRY:-ghcr.io/constructorfabric}"
 HOST="${HOST:-platform-host.local}"
+# Host port used when the edge is reached via a port-forward fallback (docker
+# driver). Matches the api-gateway bind (:8087).
+EDGE_PORT="${EDGE_PORT:-8087}"
 TOKEN="${TOKEN:-test-token}"
 BUILD_PROFILE="${BUILD_PROFILE:-dev}"
 TID="00000000-df51-5b42-9538-d2b56b7ee953"
@@ -211,12 +214,49 @@ deploy_stack() {
 smoke() {
   need kubectl; need curl; need minikube
   local mip base resolve
-  mip="$(minikube ip)"
-  base="http://$HOST"
-  resolve=(--resolve "$HOST:80:$mip")
-  log "Smoke test via edge $base (minikube ip $mip)"
+  resolve=()
 
-  # Wait for the edge to answer before asserting (route sync happens shortly after).
+  # How the host reaches the edge depends on the minikube driver. On Linux / VM
+  # drivers the edge Ingress is reachable at `minikube ip`; on the docker driver
+  # (macOS / Windows) that IP is not routable from the host without a running
+  # `minikube tunnel`. Probe the Ingress for a short window; if it never answers,
+  # fall back to a port-forward of the platform-host edge Service, which works on
+  # every driver. The fallback bypasses the nginx Ingress hop but still exercises
+  # the edge (api-gateway) -> OoP pod seams the assertions below check.
+  mip="$(minikube ip 2>/dev/null || true)"
+  local ingress_ok="" probe_deadline=$(( SECONDS + 30 ))
+  if [[ -n "$mip" ]]; then
+    log "Probing edge Ingress at $HOST -> $mip (up to 30s)"
+    while (( SECONDS < probe_deadline )); do
+      if [[ "$(curl -s -o /dev/null -w '%{http_code}' --max-time 5 \
+              --resolve "$HOST:80:$mip" "http://$HOST/healthz" || true)" == "200" ]]; then
+        ingress_ok=1; break
+      fi
+      sleep 2
+    done
+  fi
+
+  if [[ -n "$ingress_ok" ]]; then
+    base="http://$HOST"; resolve=(--resolve "$HOST:80:$mip")
+    log "Edge reachable via Ingress $base (minikube ip $mip)"
+  else
+    log "Ingress not reachable from the host (docker driver without 'minikube tunnel'?)"
+    log "Falling back to a port-forward of svc/platform-host -> 127.0.0.1:$EDGE_PORT"
+    kubectl -n "$NS" port-forward "svc/platform-host" "${EDGE_PORT}:8087" \
+      >/tmp/oop-smoke-pf.log 2>&1 &
+    PF_PID=$!
+    # Kill the port-forward on any exit (success, failure, or Ctrl-C).
+    trap '[[ -n "${PF_PID:-}" ]] && kill "$PF_PID" 2>/dev/null || true' EXIT
+    base="http://127.0.0.1:${EDGE_PORT}"
+    # An inert --resolve (127.0.0.1 -> 127.0.0.1) rather than an empty array: on
+    # macOS bash 3.2 with `set -u`, expanding an empty `"${resolve[@]}"` errors as
+    # an unbound variable, and this keeps the ~10 call sites below unchanged.
+    resolve=(--resolve "127.0.0.1:${EDGE_PORT}:127.0.0.1")
+    log "Edge via port-forward $base (pid $PF_PID)"
+  fi
+
+  # Wait for the edge to answer before asserting (route sync happens shortly after,
+  # and the port-forward needs a moment to establish).
   local deadline=$(( SECONDS + 120 ))
   until [[ "$(curl -s -o /dev/null -w '%{http_code}' "${resolve[@]}" "$base/healthz" || true)" == "200" ]]; do
     (( SECONDS < deadline )) || die "edge /healthz never returned 200 within 120s"
