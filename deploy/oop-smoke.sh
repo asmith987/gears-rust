@@ -312,21 +312,45 @@ smoke() {
   assert_contains "consumer charge -> payment_id" '"payment_id"' "$body"
   assert_contains "consumer charge -> status pending" '"status":"pending"' "$body"
 
-  # 8) cluster coordination — the consumer resolves the cluster facades from the
-  #    cluster POD over gRPC (endpoint derived by DNS convention, discovered at
-  #    :50051) and exercises all three primitives: distributed lock (acquire +
-  #    release), cache (put + get), and leader election (join + observe + resign).
-  #    Unlike the loopback e2e (where the k8s DNS name does not resolve and this
-  #    returns 503), in-cluster this round-trips.
+  # 8) cluster coordination — the seat-reservation consumer resolves the cluster
+  #    facades from the cluster POD over gRPC (endpoint derived by DNS convention,
+  #    discovered at :50051) and exercises all three primitives: cache
+  #    compare-and-swap (the seat record), a per-seat distributed lock (contention
+  #    damper), and a leader-elected background sweeper. Unlike the loopback e2e
+  #    (where the k8s DNS name does not resolve and these return 503), in-cluster
+  #    they succeed. The reserve → confirm → release cycle drives a seat through
+  #    its whole lifecycle.
   body="$(curl -s "${resolve[@]}" "$base/cluster-consumer/v1/ping")"
   assert_contains "cluster-consumer ping proxied (pong)" '"message":"pong"' "$body"
+
+  # reserve a seat: Available -> Held via CAS
   body="$(curl -s -X POST -H 'Content-Type: application/json' \
-    -d '{"key":"seat/12","value":"held"}' \
-    "${resolve[@]}" "$base/cluster-consumer/v1/roundtrip")"
-  assert_contains "cluster cache: reads back the value" '"value":"held"' "$body"
-  assert_contains "cluster lock: acquired + released" '"lock_released":true' "$body"
-  assert_contains "cluster leader election: leader observed" '"is_leader":true' "$body"
-  assert_contains "cluster round-trip served_by is the consumer pod" 'cluster-consumer-oop' "$body"
+    -d '{"seat":"A12","holder":"smoke-test"}' \
+    "${resolve[@]}" "$base/cluster-consumer/v1/reservations")"
+  assert_contains "cluster reserve: seat held via CAS" '"status":"held"' "$body"
+  assert_contains "cluster reserve: holder recorded" '"holder":"smoke-test"' "$body"
+  assert_contains "cluster reserve: backed by a cache version" '"version"' "$body"
+  assert_contains "cluster reserve served_by is the consumer pod" 'cluster-consumer-oop' "$body"
+
+  # confirm the hold: Held -> Booked via CAS
+  body="$(curl -s -X POST -H 'Content-Type: application/json' \
+    -d '{"holder":"smoke-test"}' \
+    "${resolve[@]}" "$base/cluster-consumer/v1/reservations/A12/confirm")"
+  assert_contains "cluster confirm: seat booked via CAS" '"status":"booked"' "$body"
+
+  # inventory reflects the full roster
+  body="$(curl -s "${resolve[@]}" "$base/cluster-consumer/v1/inventory")"
+  assert_contains "cluster inventory: full roster reported" '"total":36' "$body"
+
+  # release the seat: Booked -> Available via CAS
+  body="$(curl -s -X DELETE -H 'Content-Type: application/json' \
+    -d '{"holder":"smoke-test"}' \
+    "${resolve[@]}" "$base/cluster-consumer/v1/reservations/A12")"
+  assert_contains "cluster release: seat freed" '"status":"available"' "$body"
+
+  # node status: the leader-elected sweeper is running on this pod
+  body="$(curl -s "${resolve[@]}" "$base/cluster-consumer/v1/status")"
+  assert_contains "cluster status: background sweeper running" '"sweeper_running":true' "$body"
 
   # 8) Log-level evidence of the platform-plane internals (best-effort).
   # Capture full logs into variables first, then grep: piping `kubectl logs`

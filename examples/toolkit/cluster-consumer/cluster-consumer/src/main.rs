@@ -11,7 +11,7 @@ mod registered_gears;
 use clap::Parser;
 use mimalloc::MiMalloc;
 use std::path::PathBuf;
-use toolkit::bootstrap::oop::{run_oop_with_options, OopRunOptions};
+use toolkit::bootstrap::oop::{OopRunOptions, run_oop_with_options};
 
 #[global_allocator]
 static GLOBAL: MiMalloc = MiMalloc;

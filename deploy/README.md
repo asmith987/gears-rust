@@ -373,13 +373,15 @@ DirectoryService. The `cluster` pair shows OoP→OoP over **gRPC**, discovered b
   the DirectoryService. `values-dev` runs **3 replicas on the `postgres` backend**
   (database `cluster` on the shared Postgres), so all pods share state and the
   Service can load-balance across them consistently.
-- **`cluster-consumer`** exposes `POST /cluster-consumer/v1/roundtrip`. Its
-  handler resolves the three cluster facades from the ClientHub — remote clients
-  the framework's proxy-wiring phase built from `cluster-sdk`'s
-  `ConsumerRegistration` — and exercises **all three primitives** in one cycle:
-  a distributed lock (`DistributedLockV1`, acquire + release), the cache
-  (`ClusterCacheV1`, put + get), and leader election (`LeaderElectionV1`, join +
-  observe + resign). The consumer binary does **not** link the cluster gear.
+- **`cluster-consumer`** is a small **seat-reservation service** exposing
+  `reservations` / `inventory` / `status` routes (see its crate docs). It resolves
+  the three cluster facades from the ClientHub — remote clients the framework's
+  proxy-wiring phase built from `cluster-sdk`'s `ConsumerRegistration` — and uses
+  **all three primitives** the way ADR-002 intends: every seat transition is a
+  versioned `ClusterCacheV1::compare_and_swap` (the correctness gate), a per-seat
+  `DistributedLockV1::try_lock` damps contention (no remote I/O held), and a
+  `LeaderElectionV1` background sweeper (one pod at a time) reclaims expired
+  holds. The consumer binary does **not** link the cluster gear.
 
 The cluster endpoint is **not** taken from config or the directory: cluster-sdk
 derives it as `cluster.{POD_NAMESPACE}.svc.cluster.local:50051` (invariant I9 —
@@ -390,17 +392,19 @@ there is no cluster-side endpoint key). Two consequences for deployment:
   Service DNS resolves. `POD_NAMESPACE` is injected from the downward API by the
   `toolkit-common` deployment template, so the consumer needs no endpoint config.
 - On plain loopback (the `make e2e-oop` suite) that DNS name does not resolve, so
-  the round-trip returns a typed `503` (`ConnectionLost`) — the seam proof. Here
-  in Kubernetes it round-trips for real:
+  a coordination call returns a typed `503` (`ConnectionLost`) — the seam proof.
+  Here in Kubernetes it succeeds for real:
 
 ```bash
-curl -s "$RESOLVE" "$BASE/cluster-consumer/v1/roundtrip" \
+curl -s "$RESOLVE" "$BASE/cluster-consumer/v1/reservations" \
   -X POST -H 'Content-Type: application/json' \
-  -d '{"key":"seat/12","value":"held"}'
-# => {"key":"seat/12","value":"held","version":1,
-#     "lock_name":"cluster-consumer/reservation","lock_released":true,
-#     "is_leader":true,"leader_status":"Leader",
-#     "served_by":"cluster-consumer-oop (pid 1)"}
+  -d '{"seat":"A12","holder":"alice"}'
+# => {"seat":"A12","status":"held","holder":"alice","expires_at_ms":...,
+#     "version":1,"served_by":"cluster-consumer-oop (pid 1)"}
+
+curl -s "$RESOLVE" "$BASE/cluster-consumer/v1/inventory"
+# => {"total":36,"available":35,"held":1,"booked":0,
+#     "available_seats":["A1","A2",...],"served_by":"cluster-consumer-oop (pid 1)"}
 ```
 
 > All three primitives are `.scoped("cluster-consumer")`, so the cache key, lock,

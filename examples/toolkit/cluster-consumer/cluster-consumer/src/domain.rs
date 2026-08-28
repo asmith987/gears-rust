@@ -1,170 +1,536 @@
-//! Domain service: exercises all three cluster coordination primitives —
-//! distributed lock (acquire + release), cache (put + get), and leader election
-//! — proving cross-pod coordination over gRPC.
+//! The reservation service: a realistic consumer of all three cluster primitives.
+//!
+//! Each seat's lifecycle is one cache key mutated by optimistic
+//! [`compare_and_swap`](ClusterCacheV1::compare_and_swap); a per-seat advisory
+//! [`try_lock`](DistributedLockV1::try_lock) damps contention on hot seats but is
+//! **not** the correctness gate — the CAS is (ADR-002). Leader-only maintenance
+//! (roster seeding + expiry sweeping) lives in [`crate::sweeper`] and calls the
+//! [`seed_roster`](ReservationService::seed_roster) /
+//! [`sweep_expired`](ReservationService::sweep_expired) methods here.
+//!
+//! Facades are resolved from the [`ClientHub`] **per call**, so the service holds
+//! only an `Arc<ClientHub>` and is oblivious to whether the cluster gear is
+//! co-located (Profile 1) or a remote gRPC proxy (Profile 3).
 
+use std::collections::HashSet;
 use std::sync::Arc;
 use std::time::Duration;
 
-use cluster_sdk::cache::{PutRequest, Ttl};
-use cluster_sdk::{ClusterCacheV1, ClusterError, DistributedLockV1, LeaderElectionV1};
+use cluster_sdk::cache::{CacheEntry, PutRequest, Ttl};
+use cluster_sdk::{ClusterCacheV1, ClusterError, DistributedLockV1, LeaderElectionV1, LockGuard};
 use toolkit::ClientHub;
-use toolkit_canonical_errors::CanonicalError;
 
+use crate::error::ReservationError;
 use crate::gear::DemoProfile;
+use crate::model::{
+    self, SeatState, is_roster_seat, now_ms, roster, roster_size, seat_id_from_key, seat_key,
+};
+use crate::sweeper::NodeState;
 
-/// The keyspace this gear works under, carved out of the `demo` profile so the
-/// demo never collides with another consumer's keys/locks/elections (DESIGN §3.8).
-const SCOPE: &str = "cluster-consumer";
-/// The leaf coordination name for the lock and election. Slash-free (a leaf name
-/// must match `[a-zA-Z0-9_-]`); the `.scoped(SCOPE)` wrappers below compose the
-/// wire name `cluster-consumer/reservation`, which the server accepts via the
-/// scope-aware `validate_scoped_cluster_name` (finding B). Cache keys use the
-/// same `SCOPE`, so all three primitives share one namespace.
-const COORD_NAME: &str = "reservation";
-/// TTL for the demo lock — a crashed holder cannot block others past this.
-const LOCK_TTL: Duration = Duration::from_secs(10);
-/// How long `lock()` waits to acquire before giving up.
-const LOCK_WAIT: Duration = Duration::from_secs(5);
-/// How long to let leadership settle (the snapshot lags backend truth by up to a
-/// renewal interval); a single participant should win within this window.
-const LEADER_SETTLE: Duration = Duration::from_secs(8);
+/// The keyspace this gear carves out of the `demo` profile, so its
+/// keys/locks/elections never collide with another consumer's (DESIGN §3.8). All
+/// three primitives are `.scoped(SCOPE)`, so wire names are `cluster-consumer/…`.
+pub const SCOPE: &str = "cluster-consumer";
 
-/// The outcome of one coordination cycle, returned to the REST layer.
-pub struct CoordinationOutcome {
-    /// The cache key that was written and read back.
-    pub key: String,
-    /// The value read back from the cache.
-    pub value: String,
-    /// The entry's monotonic version (`>= 1`).
-    pub version: u64,
-    /// The distributed lock that was held (a non-empty name proves acquisition).
-    pub lock_name: String,
-    /// Whether the lock was explicitly released (vs. left to lapse via TTL).
-    pub lock_released: bool,
-    /// Whether this participant observed itself as leader of the election.
-    pub is_leader: bool,
-    /// The observed leadership status (`Leader` / `Follower` / ...).
-    pub leader_status: String,
-    /// The serving process — proof the request reached this `OoP` pod.
-    pub served_by: String,
+/// TTL of the per-seat advisory lock. Short: it only spans the fast, local
+/// bookkeeping between `try_lock` and `release` (no remote I/O — ADR-002), so a
+/// crashed holder cannot block a seat for long.
+const LOCK_TTL: Duration = Duration::from_secs(5);
+/// How long a `Held` claim survives before it lapses back to `Available` (whether
+/// or not the leader's sweeper has reclaimed it yet).
+const HOLD_TTL: Duration = Duration::from_secs(30);
+/// Bound on the optimistic-concurrency retry loop before a caller is told the
+/// seat is too hot right now (`Contended` → 409, client may retry).
+const MAX_CAS_ATTEMPTS: u32 = 5;
+/// Cap on how many free seat ids `inventory` echoes, so a large venue's response
+/// stays small.
+const MAX_LISTED_AVAILABLE: usize = 16;
+
+/// A seat's current state as returned to the API layer.
+pub struct SeatView {
+    /// The seat id, e.g. `A12`.
+    pub seat: String,
+    /// `"available"`, `"held"`, or `"booked"`.
+    pub status: &'static str,
+    /// The holder, when held or booked.
+    pub holder: Option<String>,
+    /// Hold expiry (epoch millis), when held.
+    pub expires_at_ms: Option<u64>,
+    /// The cache version backing this state; `None` for a roster seat never
+    /// written (logically `Available`).
+    pub version: Option<u64>,
 }
 
-/// Resolves the three cluster facades from the hub per call and runs one
-/// coordination cycle. Holding only an `Arc<ClientHub>` keeps this
-/// binding-mode-agnostic: co-located cluster gear (Profile 1) or the remote gRPC
-/// proxy (Profile 3) is invisible here.
-pub struct CoordinationService {
-    hub: Arc<ClientHub>,
-}
-
-impl CoordinationService {
-    /// Build the service over a `ClientHub` handle (typically `ctx.client_hub()`).
-    #[must_use]
-    pub fn new(hub: Arc<ClientHub>) -> Self {
-        Self { hub }
+impl SeatView {
+    fn from_state(seat: String, state: &SeatState, version: u64) -> Self {
+        let (holder, expires) = match state {
+            SeatState::Available => (None, None),
+            SeatState::Held {
+                holder,
+                expires_at_ms,
+            } => (Some(holder.clone()), Some(*expires_at_ms)),
+            SeatState::Booked { holder } => (Some(holder.clone()), None),
+        };
+        SeatView {
+            seat,
+            status: state.label(),
+            holder,
+            expires_at_ms: expires,
+            version: Some(version),
+        }
     }
 
-    /// Run a full coordination cycle for `key`/`value`:
-    ///
-    /// 1. **Lock** — acquire the `reservation` lock, then release it. Per ADR-002
-    ///    no remote I/O happens while the guard is held, so the cache write below
-    ///    is performed *after* release (the lock serializes; it does not wrap the
-    ///    mutation).
-    /// 2. **Cache** — `put` then `get` the reservation value.
-    /// 3. **Leader election** — join the `reservation` election, observe whether
-    ///    this participant is leader, then resign.
+    /// A synthetic `Available` view for a roster seat that has never been written.
+    fn available(seat: String) -> Self {
+        SeatView {
+            seat,
+            status: "available",
+            holder: None,
+            expires_at_ms: None,
+            version: None,
+        }
+    }
+}
+
+/// Venue-wide availability, from a `scan_prefix` over the seat records.
+pub struct InventorySummary {
+    /// Total seats in the roster.
+    pub total: usize,
+    /// Seats currently free (roster minus held/booked).
+    pub available: usize,
+    /// Seats under an unexpired hold.
+    pub held: usize,
+    /// Seats confirmed (booked).
+    pub booked: usize,
+    /// Up to [`MAX_LISTED_AVAILABLE`] free seat ids, in roster order.
+    pub available_seats: Vec<String>,
+}
+
+/// Resolves the cluster facades per call and runs the reservation domain logic.
+pub struct ReservationService {
+    hub: Arc<ClientHub>,
+    node: Arc<NodeState>,
+}
+
+impl ReservationService {
+    /// Build over a `ClientHub` handle (typically `ctx.client_hub()`) and the
+    /// shared node state the sweeper updates and `/status` reports.
+    #[must_use]
+    pub fn new(hub: Arc<ClientHub>, node: Arc<NodeState>) -> Self {
+        Self { hub, node }
+    }
+
+    /// The shared leader/sweeper status this pod reports on `/status`.
+    #[must_use]
+    pub fn node(&self) -> &Arc<NodeState> {
+        &self.node
+    }
+
+    // --- facade resolution (per call, binding-mode-agnostic) ----------------
+
+    async fn cache(&self) -> Result<ClusterCacheV1, ReservationError> {
+        ClusterCacheV1::resolver(&self.hub)
+            .profile(DemoProfile)
+            .resolve()
+            .await
+            .map_err(ReservationError::unavailable)?
+            .scoped(SCOPE)
+            .map_err(ReservationError::unavailable)
+    }
+
+    async fn locks(&self) -> Result<DistributedLockV1, ReservationError> {
+        DistributedLockV1::resolver(&self.hub)
+            .profile(DemoProfile)
+            .resolve()
+            .await
+            .map_err(ReservationError::unavailable)?
+            .scoped(SCOPE)
+            .map_err(ReservationError::unavailable)
+    }
+
+    /// The scoped leader-election facade — used by [`crate::sweeper`] to campaign
+    /// for the singleton maintenance role.
     ///
     /// # Errors
-    /// Returns [`CanonicalError::service_unavailable`] when any cluster call
-    /// cannot be resolved or reached (on loopback the k8s DNS endpoint does not
-    /// resolve, so the first call returns a retryable `Provider{ConnectionLost}`),
-    /// carrying the underlying [`ClusterError`] in the detail. Returns
-    /// [`CanonicalError::internal`] if the key vanished between `put` and `get`.
-    pub async fn coordinate(
-        &self,
-        key: String,
-        value: String,
-    ) -> Result<CoordinationOutcome, CanonicalError> {
-        // 1) LOCK: acquire, then release. The critical section holds no remote I/O
-        //    (ADR-002) — it exists here to serialize concurrent coordinators.
-        let lock = DistributedLockV1::resolver(&self.hub)
+    /// [`ReservationError::ClusterUnavailable`] if the cluster cannot be resolved
+    /// or reached.
+    pub async fn leader(&self) -> Result<LeaderElectionV1, ReservationError> {
+        LeaderElectionV1::resolver(&self.hub)
             .profile(DemoProfile)
             .resolve()
             .await
-            .map_err(|e| unavailable(&e))?
+            .map_err(ReservationError::unavailable)?
             .scoped(SCOPE)
-            .map_err(|e| unavailable(&e))?;
-        let guard = lock
-            .lock(COORD_NAME, LOCK_TTL, LOCK_WAIT)
-            .await
-            .map_err(|e| unavailable(&e))?;
-        let lock_name = guard.name().to_owned();
-        guard.release().await.map_err(|e| unavailable(&e))?;
+            .map_err(ReservationError::unavailable)
+    }
 
-        // 2) CACHE: the remote effect, performed outside the lock window.
-        let cache = ClusterCacheV1::resolver(&self.hub)
-            .profile(DemoProfile)
-            .resolve()
-            .await
-            .map_err(|e| unavailable(&e))?
-            .scoped(SCOPE)
-            .map_err(|e| unavailable(&e))?;
-        cache
-            .put(PutRequest {
-                key: &key,
-                value: value.as_bytes(),
-                ttl: Ttl::Indefinite,
-            })
-            .await
-            .map_err(|e| unavailable(&e))?;
-        let entry = cache.get(&key).await.map_err(|e| unavailable(&e))?.ok_or_else(|| {
-            CanonicalError::internal(
-                "cache reported the key absent immediately after a successful put",
-            )
-            .create()
-        })?;
+    // --- request-path operations --------------------------------------------
 
-        // 3) LEADER ELECTION: join, let leadership settle, then resign.
-        let leader = LeaderElectionV1::resolver(&self.hub)
-            .profile(DemoProfile)
-            .resolve()
-            .await
-            .map_err(|e| unavailable(&e))?
-            .scoped(SCOPE)
-            .map_err(|e| unavailable(&e))?;
-        let mut watch = leader.elect(COORD_NAME).await.map_err(|e| unavailable(&e))?;
-        // The snapshot lags backend truth; poll (via `changed`) until we observe
-        // leadership or the settle window elapses. A single participant wins.
-        let settle_by = tokio::time::Instant::now() + LEADER_SETTLE;
-        while !watch.is_leader() && tokio::time::Instant::now() < settle_by {
-            // Advance to the next status event (or tick on timeout), then re-check
-            // the snapshot; the outcome itself is intentionally ignored.
-            let _elapsed = tokio::time::timeout(Duration::from_secs(1), watch.changed()).await;
+    /// Reserve `seat_id` for `holder`: place (or refresh) a soft, expiring hold.
+    ///
+    /// Acquires the seat's advisory lock and releases it immediately (a contention
+    /// damper holding no remote I/O), then commits the `Available → Held`
+    /// transition with a versioned CAS, retrying on a lost race. Re-reserving a
+    /// seat you already hold is idempotent.
+    ///
+    /// # Errors
+    /// - [`ReservationError::UnknownSeat`] / [`InvalidInput`](ReservationError::InvalidInput)
+    ///   for bad input,
+    /// - [`SeatTaken`](ReservationError::SeatTaken) if another holder has it,
+    /// - [`Contended`](ReservationError::Contended) if the CAS lost too many times,
+    /// - [`ClusterUnavailable`](ReservationError::ClusterUnavailable) if the plane
+    ///   is unreachable.
+    pub async fn reserve(&self, seat_id: &str, holder: &str) -> Result<SeatView, ReservationError> {
+        let seat = normalize_seat(seat_id)?;
+        let holder = validate_holder(holder)?;
+        let key = seat_key(&seat);
+        let cache = self.cache().await?;
+
+        // Advisory coarse lock: reduce the odds of a CAS storm on a hot seat. Held
+        // with NO remote I/O inside (ADR-002) — we take it and release it right
+        // away; a concurrent holder means "being reserved right now", a clean
+        // fast-fail rather than hammering the CAS below. The CAS is the gate.
+        match self.locks().await?.try_lock(&key, LOCK_TTL).await {
+            Ok(guard) => release_guard(guard).await?,
+            Err(ClusterError::LockContended { .. }) => {
+                return Err(ReservationError::Contended { seat });
+            }
+            Err(e) => return Err(ReservationError::unavailable(e)),
         }
-        let is_leader = watch.is_leader();
-        let leader_status = format!("{:?}", watch.status());
-        watch.resign().await.map_err(|e| unavailable(&e))?;
 
-        Ok(CoordinationOutcome {
-            key,
-            value: String::from_utf8_lossy(&entry.value).into_owned(),
-            version: entry.version,
-            lock_name,
-            lock_released: true,
-            is_leader,
-            leader_status,
-            served_by: format!("cluster-consumer-oop (pid {})", std::process::id()),
+        for _ in 0..MAX_CAS_ATTEMPTS {
+            let now = now_ms();
+            let held = SeatState::Held {
+                holder: holder.clone(),
+                expires_at_ms: now.saturating_add(millis(HOLD_TTL)),
+            };
+
+            let Some(entry) = self.get(&cache, &key).await? else {
+                // Never written: try to create it held in one shot. A racer that
+                // beat us makes `put_if_absent` return `None` → re-read and CAS.
+                match cache
+                    .put_if_absent(PutRequest {
+                        key: &key,
+                        value: &held.encode(),
+                        ttl: Ttl::Indefinite,
+                    })
+                    .await
+                    .map_err(ReservationError::unavailable)?
+                {
+                    Some(entry) => return Ok(SeatView::from_state(seat, &held, entry.version)),
+                    None => continue,
+                }
+            };
+
+            let state = decode(&entry.value, &seat)?;
+            if let Some(current_holder) = state.holder() {
+                if current_holder == holder && !state.is_expired_hold(now) {
+                    // Idempotent: caller already holds/booked it.
+                    return Ok(SeatView::from_state(seat, &state, entry.version));
+                }
+                if !state.is_reservable(now) {
+                    return Err(ReservationError::SeatTaken {
+                        seat,
+                        by: current_holder.to_owned(),
+                        state: state.label(),
+                    });
+                }
+            }
+
+            // Available, or a lapsed hold — take it under the read version.
+            match cache
+                .compare_and_swap(&key, entry.version, &held.encode(), Ttl::Indefinite)
+                .await
+            {
+                Ok(new_entry) => return Ok(SeatView::from_state(seat, &held, new_entry.version)),
+                Err(ClusterError::CasConflict { .. }) => {} // lost the race → retry
+                Err(e) => return Err(ReservationError::unavailable(e)),
+            }
+        }
+        Err(ReservationError::Contended { seat })
+    }
+
+    /// Confirm a held seat (`Held → Booked`) for `holder`. Idempotent if already
+    /// booked by the same holder.
+    ///
+    /// # Errors
+    /// [`NotHeldByYou`](ReservationError::NotHeldByYou) if the seat is not held by
+    /// `holder` (or the hold lapsed); the usual contention/availability errors
+    /// otherwise.
+    pub async fn confirm(&self, seat_id: &str, holder: &str) -> Result<SeatView, ReservationError> {
+        let seat = normalize_seat(seat_id)?;
+        let holder = validate_holder(holder)?;
+        let key = seat_key(&seat);
+        let cache = self.cache().await?;
+
+        for _ in 0..MAX_CAS_ATTEMPTS {
+            let now = now_ms();
+            let Some(entry) = self.get(&cache, &key).await? else {
+                return Err(ReservationError::NotHeldByYou { seat, holder });
+            };
+            let state = decode(&entry.value, &seat)?;
+            match &state {
+                SeatState::Booked { holder: h } if *h == holder => {
+                    return Ok(SeatView::from_state(seat, &state, entry.version)); // already confirmed
+                }
+                SeatState::Held {
+                    holder: h,
+                    expires_at_ms,
+                } if *h == holder && *expires_at_ms > now => {
+                    let booked = SeatState::Booked {
+                        holder: holder.clone(),
+                    };
+                    match cache
+                        .compare_and_swap(&key, entry.version, &booked.encode(), Ttl::Indefinite)
+                        .await
+                    {
+                        Ok(new_entry) => {
+                            return Ok(SeatView::from_state(seat, &booked, new_entry.version));
+                        }
+                        Err(ClusterError::CasConflict { .. }) => {} // retry
+                        Err(e) => return Err(ReservationError::unavailable(e)),
+                    }
+                }
+                _ => return Err(ReservationError::NotHeldByYou { seat, holder }),
+            }
+        }
+        Err(ReservationError::Contended { seat })
+    }
+
+    /// Release a seat `holder` holds or booked, back to `Available`. Idempotent on
+    /// an already-free seat.
+    ///
+    /// # Errors
+    /// [`NotHeldByYou`](ReservationError::NotHeldByYou) if a different holder owns
+    /// the seat; contention/availability errors otherwise.
+    pub async fn release(&self, seat_id: &str, holder: &str) -> Result<SeatView, ReservationError> {
+        let seat = normalize_seat(seat_id)?;
+        let holder = validate_holder(holder)?;
+        let key = seat_key(&seat);
+        let cache = self.cache().await?;
+
+        for _ in 0..MAX_CAS_ATTEMPTS {
+            let Some(entry) = self.get(&cache, &key).await? else {
+                return Ok(SeatView::available(seat)); // nothing to release
+            };
+            let state = decode(&entry.value, &seat)?;
+            match state.holder() {
+                None => return Ok(SeatView::from_state(seat, &state, entry.version)), // already free
+                Some(h) if h == holder => {
+                    let free = SeatState::Available;
+                    match cache
+                        .compare_and_swap(&key, entry.version, &free.encode(), Ttl::Indefinite)
+                        .await
+                    {
+                        Ok(new_entry) => {
+                            return Ok(SeatView::from_state(seat, &free, new_entry.version));
+                        }
+                        Err(ClusterError::CasConflict { .. }) => {} // retry
+                        Err(e) => return Err(ReservationError::unavailable(e)),
+                    }
+                }
+                Some(_) => return Err(ReservationError::NotHeldByYou { seat, holder }),
+            }
+        }
+        Err(ReservationError::Contended { seat })
+    }
+
+    /// Read a single seat's current state. A roster seat never written reads back
+    /// as a synthetic `Available`.
+    ///
+    /// # Errors
+    /// [`UnknownSeat`](ReservationError::UnknownSeat) for a non-roster id;
+    /// [`ClusterUnavailable`](ReservationError::ClusterUnavailable) if unreachable.
+    pub async fn get_seat(&self, seat_id: &str) -> Result<SeatView, ReservationError> {
+        let seat = normalize_seat(seat_id)?;
+        let key = seat_key(&seat);
+        let cache = self.cache().await?;
+        match self.get(&cache, &key).await? {
+            Some(entry) => {
+                let state = decode(&entry.value, &seat)?;
+                Ok(SeatView::from_state(seat, &state, entry.version))
+            }
+            None => Ok(SeatView::available(seat)),
+        }
+    }
+
+    /// Venue-wide availability, from one `scan_prefix` plus a read per written seat.
+    ///
+    /// # Errors
+    /// [`ClusterUnavailable`](ReservationError::ClusterUnavailable) if the cluster
+    /// is unreachable.
+    pub async fn inventory(&self) -> Result<InventorySummary, ReservationError> {
+        let cache = self.cache().await?;
+        let now = now_ms();
+        let keys = cache
+            .scan_prefix(model::SEAT_KEY_PREFIX)
+            .await
+            .map_err(ReservationError::unavailable)?;
+
+        let mut held = 0usize;
+        let mut booked = 0usize;
+        let mut taken: HashSet<String> = HashSet::new();
+        for key in keys {
+            let Some(entry) = self.get(&cache, &key).await? else {
+                continue;
+            };
+            // A record we can't decode is skipped rather than failing the whole
+            // listing — it never counts against availability.
+            let Ok(state) = SeatState::decode(&entry.value) else {
+                continue;
+            };
+            let Some(seat) = seat_id_from_key(&key) else {
+                continue;
+            };
+            match state {
+                SeatState::Booked { .. } => {
+                    booked += 1;
+                    taken.insert(seat.to_owned());
+                }
+                SeatState::Held { .. } if !state.is_expired_hold(now) => {
+                    held += 1;
+                    taken.insert(seat.to_owned());
+                }
+                _ => {} // available or lapsed hold → still free
+            }
+        }
+
+        let available_seats: Vec<String> = roster()
+            .into_iter()
+            .filter(|seat| !taken.contains(seat))
+            .take(MAX_LISTED_AVAILABLE)
+            .collect();
+
+        Ok(InventorySummary {
+            total: roster_size(),
+            available: roster_size().saturating_sub(held + booked),
+            held,
+            booked,
+            available_seats,
         })
+    }
+
+    // --- leader-only maintenance (called from the sweeper) ------------------
+
+    /// Idempotently create every roster seat as `Available`. Run by the elected
+    /// leader on taking office; `put_if_absent` makes re-seeding a no-op.
+    ///
+    /// # Errors
+    /// [`ClusterUnavailable`](ReservationError::ClusterUnavailable) on a cluster
+    /// failure.
+    pub async fn seed_roster(&self) -> Result<(), ReservationError> {
+        let cache = self.cache().await?;
+        let available = SeatState::Available.encode();
+        for seat in roster() {
+            let key = seat_key(&seat);
+            cache
+                .put_if_absent(PutRequest {
+                    key: &key,
+                    value: &available,
+                    ttl: Ttl::Indefinite,
+                })
+                .await
+                .map_err(ReservationError::unavailable)?;
+        }
+        Ok(())
+    }
+
+    /// Reclaim every expired hold back to `Available`, returning how many were
+    /// reclaimed. Run periodically by the elected leader only.
+    ///
+    /// A lost CAS is ignored (a successor already changed the seat); a transport
+    /// error aborts the pass so the caller can back off.
+    ///
+    /// # Errors
+    /// [`ClusterUnavailable`](ReservationError::ClusterUnavailable) if a cache
+    /// call fails at the transport level.
+    pub async fn sweep_expired(&self) -> Result<u64, ReservationError> {
+        let cache = self.cache().await?;
+        let now = now_ms();
+        let keys = cache
+            .scan_prefix(model::SEAT_KEY_PREFIX)
+            .await
+            .map_err(ReservationError::unavailable)?;
+
+        let available = SeatState::Available.encode();
+        let mut reclaimed = 0u64;
+        for key in keys {
+            let Some(entry) = self.get(&cache, &key).await? else {
+                continue;
+            };
+            let Ok(state) = SeatState::decode(&entry.value) else {
+                continue; // leave records this version can't read
+            };
+            if state.is_expired_hold(now) {
+                match cache
+                    .compare_and_swap(&key, entry.version, &available, Ttl::Indefinite)
+                    .await
+                {
+                    Ok(_) => reclaimed += 1,
+                    Err(ClusterError::CasConflict { .. }) => {} // a successor won; fine
+                    Err(e) => return Err(ReservationError::unavailable(e)),
+                }
+            }
+        }
+        Ok(reclaimed)
+    }
+
+    /// One `get`, mapping a transport failure to the domain's unavailable error.
+    async fn get(
+        &self,
+        cache: &ClusterCacheV1,
+        key: &str,
+    ) -> Result<Option<CacheEntry>, ReservationError> {
+        cache.get(key).await.map_err(ReservationError::unavailable)
     }
 }
 
-/// Maps a [`ClusterError`] to a 503 whose detail names the failure.
-///
-/// The error renders its own message (an endpoint, a provider name, a typed
-/// kind) with no caller-supplied data, so it is safe for the public `Problem`
-/// body per the `with_detail` contract.
-fn unavailable(err: &ClusterError) -> CanonicalError {
-    CanonicalError::service_unavailable()
-        .with_detail(format!("cluster coordination call failed: {err}"))
-        .create()
+/// The serving process — proof a request reached this `OoP` pod.
+#[must_use]
+pub fn served_by() -> String {
+    format!("cluster-consumer-oop (pid {})", std::process::id())
+}
+
+/// Uppercase-normalize and validate a seat id against the roster.
+fn normalize_seat(seat_id: &str) -> Result<String, ReservationError> {
+    let seat = seat_id.trim().to_ascii_uppercase();
+    if is_roster_seat(&seat) {
+        Ok(seat)
+    } else {
+        Err(ReservationError::UnknownSeat { seat })
+    }
+}
+
+/// Validate a holder identity: non-blank and bounded.
+fn validate_holder(holder: &str) -> Result<String, ReservationError> {
+    let holder = holder.trim();
+    if holder.is_empty() {
+        return Err(ReservationError::InvalidInput {
+            detail: "holder must not be empty".to_owned(),
+        });
+    }
+    if holder.len() > 64 {
+        return Err(ReservationError::InvalidInput {
+            detail: "holder must be at most 64 characters".to_owned(),
+        });
+    }
+    Ok(holder.to_owned())
+}
+
+/// Decode a seat record, turning a bad value into a `Corrupt` domain error.
+fn decode(bytes: &[u8], seat: &str) -> Result<SeatState, ReservationError> {
+    SeatState::decode(bytes).map_err(|e| ReservationError::Corrupt {
+        seat: seat.to_owned(),
+        detail: e.to_string(),
+    })
+}
+
+/// Release an advisory lock guard, mapping failure to the unavailable error.
+async fn release_guard(guard: LockGuard) -> Result<(), ReservationError> {
+    guard.release().await.map_err(ReservationError::unavailable)
+}
+
+/// `Duration` → whole milliseconds, saturating.
+fn millis(d: Duration) -> u64 {
+    u64::try_from(d.as_millis()).unwrap_or(u64::MAX)
 }

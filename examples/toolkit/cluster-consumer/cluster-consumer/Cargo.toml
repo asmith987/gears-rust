@@ -5,14 +5,15 @@ publish = false
 edition.workspace = true
 license.workspace = true
 authors.workspace = true
-description = "Minimal cluster-consuming demo gear (Profile 3): resolves ClusterCacheV1 over gRPC and does a cache round-trip"
+description = "Cluster-consuming demo gear (Profile 3): a seat-reservation service built on the cluster cache (CAS), distributed lock, and leader election"
 
 [lints]
 workspace = true
 
-# OoP binary: only built with `oop_module` (pulls in the tokio runtime +
-# bootstrap entrypoint). The library is always available for in-process linking
-# (Profile 1) without the binary.
+# OoP binary: only built with `oop_module` (adds the bootstrap entrypoint). The
+# library is always available for in-process linking (Profile 1) without the
+# binary; its coordination + sweeper logic uses Tokio unconditionally, so `tokio`
+# is a normal (non-optional) dependency.
 [[bin]]
 name = "cluster-consumer-oop"
 path = "src/main.rs"
@@ -20,8 +21,8 @@ required-features = ["oop_module"]
 
 [features]
 default = []
-# Build the standalone OoP binary (adds the async runtime + bootstrap).
-oop_module = ["dep:tokio", "toolkit/bootstrap"]
+# Build the standalone OoP binary (adds the bootstrap entrypoint).
+oop_module = ["toolkit/bootstrap"]
 # Kubernetes TokenReview platform-plane auth.
 k8s-auth = ["toolkit/k8s-auth"]
 
@@ -41,13 +42,15 @@ cluster-sdk = { workspace = true, features = ["grpc-client"] }
 axum = { workspace = true }
 http = { workspace = true }
 
-# Serialization (REST DTOs / OpenAPI)
+# Serialization (REST DTOs / OpenAPI + the JSON seat records stored in the cache)
 serde = { workspace = true }
+serde_json = { workspace = true }
 utoipa = { workspace = true }
 
 # Async
 async-trait = { workspace = true }
-tokio = { workspace = true, optional = true }
+tokio = { workspace = true }
+tokio-util = { workspace = true }
 
 # Utils
 anyhow = { workspace = true }

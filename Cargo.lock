@@ -4089,7 +4089,9 @@ dependencies = [
  "inventory",
  "mimalloc",
  "serde",
+ "serde_json",
  "tokio",
+ "tokio-util",
  "tracing",
  "utoipa",
 ]

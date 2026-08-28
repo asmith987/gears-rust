@@ -6,15 +6,17 @@
 #     cargo run -p cluster-consumer --features oop_module --bin cluster-consumer-oop \
 #       -- --config config/oop-cluster-consumer.yaml
 #
-# Then:
-#   curl -X POST http://127.0.0.1:8087/cluster-consumer/v1/roundtrip \
-#        -H 'Content-Type: application/json' -d '{"key":"seat/12","value":"held"}'
+# Then (reserve a seat, then read the venue inventory):
+#   curl -X POST http://127.0.0.1:8087/cluster-consumer/v1/reservations \
+#        -H 'Content-Type: application/json' -d '{"seat":"A12","holder":"me"}'
+#   curl http://127.0.0.1:8087/cluster-consumer/v1/inventory
 #
 # POD_NAMESPACE is what cluster_sdk::wiring uses to derive the cluster gRPC
 # endpoint (cluster.{POD_NAMESPACE}.svc.cluster.local:50051). On loopback that
-# name does not resolve, so the round-trip returns a typed ConnectionLost (503) —
-# the seam proof. In Kubernetes the downward API supplies POD_NAMESPACE and the
-# DNS name resolves, so the round-trip succeeds.
+# name does not resolve, so a coordination call returns a typed ConnectionLost
+# (503) — the seam proof. In Kubernetes the downward API supplies POD_NAMESPACE
+# and the DNS name resolves, so the reservation flow succeeds. The cluster-free
+# /ping and /status routes answer either way.
 
 server:
   home_dir: "~/.cf-gears-cluster-consumer"
