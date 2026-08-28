@@ -398,14 +398,15 @@ curl -s "$RESOLVE" "$BASE/cluster-consumer/v1/roundtrip" \
   -X POST -H 'Content-Type: application/json' \
   -d '{"key":"seat/12","value":"held"}'
 # => {"key":"seat/12","value":"held","version":1,
-#     "lock_name":"cluster-consumer-reservation","lock_released":true,
+#     "lock_name":"cluster-consumer/reservation","lock_released":true,
 #     "is_leader":true,"leader_status":"Leader",
 #     "served_by":"cluster-consumer-oop (pid 1)"}
 ```
 
-> Lock/leader coordination *names* must match `[a-zA-Z0-9_-]` (no `/`), unlike
-> cache *keys*, so the demo uses a flat name and does not `.scoped()` the
-> lock/leader facades (cache scoping is fine).
+> All three primitives are `.scoped("cluster-consumer")`, so the cache key, lock,
+> and election share one namespace — the lock/election wire name composes as
+> `cluster-consumer/reservation`. A leaf name is slash-free (`[a-zA-Z0-9_-]`); the
+> server validates the composed, `/`-separated name with `validate_scoped_cluster_name`.
 
 Platform-plane auth: cluster's grpc-hub enforces `X-ToolKit-Internal-Token` via
 `TokenReview` (its chart's `rbac.yaml` binds `system:auth-delegator`); the

@@ -15,12 +15,12 @@ use crate::gear::DemoProfile;
 /// The keyspace this gear works under, carved out of the `demo` profile so the
 /// demo never collides with another consumer's keys/locks/elections (DESIGN §3.8).
 const SCOPE: &str = "cluster-consumer";
-/// The lock and election coordinate under this name. Unlike cache *keys* (which
-/// allow `/` for scoping), lock/leader *names* must match `[a-zA-Z0-9_-]`
-/// (`validate_cluster_name`), so this is a flat, slash-free name — do NOT apply
-/// `.scoped()` to the lock/leader facades (its `prefix + "/"` would be rejected
-/// on the remote path).
-const COORD_NAME: &str = "cluster-consumer-reservation";
+/// The leaf coordination name for the lock and election. Slash-free (a leaf name
+/// must match `[a-zA-Z0-9_-]`); the `.scoped(SCOPE)` wrappers below compose the
+/// wire name `cluster-consumer/reservation`, which the server accepts via the
+/// scope-aware `validate_scoped_cluster_name` (finding B). Cache keys use the
+/// same `SCOPE`, so all three primitives share one namespace.
+const COORD_NAME: &str = "reservation";
 /// TTL for the demo lock — a crashed holder cannot block others past this.
 const LOCK_TTL: Duration = Duration::from_secs(10);
 /// How long `lock()` waits to acquire before giving up.
@@ -91,6 +91,8 @@ impl CoordinationService {
             .profile(DemoProfile)
             .resolve()
             .await
+            .map_err(|e| unavailable(&e))?
+            .scoped(SCOPE)
             .map_err(|e| unavailable(&e))?;
         let guard = lock
             .lock(COORD_NAME, LOCK_TTL, LOCK_WAIT)
@@ -127,6 +129,8 @@ impl CoordinationService {
             .profile(DemoProfile)
             .resolve()
             .await
+            .map_err(|e| unavailable(&e))?
+            .scoped(SCOPE)
             .map_err(|e| unavailable(&e))?;
         let mut watch = leader.elect(COORD_NAME).await.map_err(|e| unavailable(&e))?;
         // The snapshot lags backend truth; poll (via `changed`) until we observe
