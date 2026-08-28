@@ -227,8 +227,9 @@ def oop_cluster(tmp_path_factory):
         _poll(
             "cluster-consumer route synced at edge",
             # The cluster-free ping returns 200 once the route exists (404 before
-            # sync). Deliberately NOT the round-trip route: that call blocks ~8s
-            # when cluster is unreachable and would exceed the probe timeout.
+            # sync). Deliberately NOT a coordination route (e.g. reservations):
+            # that call blocks ~8s when cluster is unreachable and would exceed
+            # the probe timeout.
             lambda: _status("GET", "/cluster-consumer/v1/ping") == 200,
             timeout=ROUTE_SYNC_TIMEOUT,
             procs=procs,

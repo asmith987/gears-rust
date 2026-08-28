@@ -116,19 +116,56 @@ def test_cluster_consumer_grpc_seam_connectionlost(oop_cluster):
     proxy-wiring phase registers a remote `dyn ClusterClient` from cluster-sdk's
     `ConsumerRegistration` before the gear's routes run. The endpoint is derived
     from k8s DNS convention (`cluster.{POD_NAMESPACE}.svc.cluster.local:50051`),
-    which does not resolve on loopback — so the `put`/`get` returns a typed,
-    retryable `Provider{ConnectionLost}`, surfaced by the handler as a 503. That
-    is the seam proof; the successful round-trip is the Kubernetes demo's job.
+    which does not resolve on loopback — so reserving a seat (which resolves the
+    cache/lock facades and calls them) returns a typed, retryable
+    `Provider{ConnectionLost}`, surfaced by the handler as a 503. That is the seam
+    proof; the successful reservation flow is the Kubernetes demo's job.
 
     Driven through the edge (like every other seam here): the unreachable call
     takes ~8s, comfortably inside the edge's 30s proxy timeout, so this exercises
-    the full ingress -> consumer pod -> cluster-gRPC path.
+    the full ingress -> consumer pod -> cluster-gRPC path. `A12` is a valid roster
+    seat, so the request passes input validation and reaches the cluster call.
     """
     r = httpx.post(
-        f"{oop_cluster}/cluster-consumer/v1/roundtrip",
-        json={"key": "seat/12", "value": "held"},
+        f"{oop_cluster}/cluster-consumer/v1/reservations",
+        json={"seat": "A12", "holder": "oop-e2e"},
         timeout=SLOW_SEAM_TIMEOUT,
     )
     assert r.status_code == 503, f"expected 503 (cluster unreachable on loopback), got {r.status_code}: {r.text}"
     # The detail names the failure, so an operator sees the seam was exercised.
     assert "cluster coordination call failed" in r.text, r.text
+
+
+@pytest.mark.smoke
+def test_cluster_consumer_status_cross_process(oop_cluster):
+    """Seam: edge reverse-proxies the consumer's cluster-free `/status` route.
+
+    Like `/ping`, `/status` reads only local state (the background sweeper's
+    role), so it answers immediately without touching the coordination plane —
+    proving cross-process proxying and that the `stateful` sweeper task is wired.
+    On loopback the consumer can never win the election, so the role is
+    `idle`/`follower`, never `leader`.
+    """
+    r = httpx.get(f"{oop_cluster}/cluster-consumer/v1/status", timeout=TIMEOUT)
+    assert r.status_code == 200, r.text
+    body = r.json()
+    assert body.get("role") in ("idle", "follower", "leader"), body
+    assert body.get("is_leader") is False, body
+    assert isinstance(body.get("sweeper_running"), bool), body
+    assert "cluster-consumer-oop" in str(body.get("served_by", "")), body
+
+
+def test_cluster_consumer_reserve_unknown_seat_is_404(oop_cluster):
+    """Seam: the reservation domain validates input before any cluster call.
+
+    `reserve` checks the seat against the venue roster first, so an unknown seat
+    is a fast `404` returned through the edge without ever touching the
+    (unreachable) coordination plane — exercising the new domain logic end-to-end
+    without needing a reachable cluster.
+    """
+    r = httpx.post(
+        f"{oop_cluster}/cluster-consumer/v1/reservations",
+        json={"seat": "Z9", "holder": "oop-e2e"},
+        timeout=TIMEOUT,
+    )
+    assert r.status_code == 404, f"unknown seat should be 404, got {r.status_code}: {r.text}"
