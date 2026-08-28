@@ -312,16 +312,20 @@ smoke() {
   assert_contains "consumer charge -> payment_id" '"payment_id"' "$body"
   assert_contains "consumer charge -> status pending" '"status":"pending"' "$body"
 
-  # 8) cluster round-trip — the consumer resolves ClusterCacheV1 from the cluster
-  #    POD over gRPC (endpoint derived by DNS convention, discovered at :50051),
-  #    writes a key then reads it back. Unlike the loopback e2e (where the k8s DNS
-  #    name does not resolve and this returns 503), in-cluster this round-trips.
+  # 8) cluster coordination — the consumer resolves the cluster facades from the
+  #    cluster POD over gRPC (endpoint derived by DNS convention, discovered at
+  #    :50051) and exercises all three primitives: distributed lock (acquire +
+  #    release), cache (put + get), and leader election (join + observe + resign).
+  #    Unlike the loopback e2e (where the k8s DNS name does not resolve and this
+  #    returns 503), in-cluster this round-trips.
   body="$(curl -s "${resolve[@]}" "$base/cluster-consumer/v1/ping")"
   assert_contains "cluster-consumer ping proxied (pong)" '"message":"pong"' "$body"
   body="$(curl -s -X POST -H 'Content-Type: application/json' \
     -d '{"key":"seat/12","value":"held"}' \
     "${resolve[@]}" "$base/cluster-consumer/v1/roundtrip")"
-  assert_contains "cluster round-trip reads back the value" '"value":"held"' "$body"
+  assert_contains "cluster cache: reads back the value" '"value":"held"' "$body"
+  assert_contains "cluster lock: acquired + released" '"lock_released":true' "$body"
+  assert_contains "cluster leader election: leader observed" '"is_leader":true' "$body"
   assert_contains "cluster round-trip served_by is the consumer pod" 'cluster-consumer-oop' "$body"
 
   # 8) Log-level evidence of the platform-plane internals (best-effort).

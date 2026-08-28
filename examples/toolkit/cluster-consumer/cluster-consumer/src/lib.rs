@@ -4,14 +4,18 @@
 //!
 //! ```text
 //! POST /cluster-consumer/v1/roundtrip  { "key": "...", "value": "..." }
-//!   -> { "key", "value", "version", "served_by" }   (cache reachable)
-//!   -> 503 with a detail naming the unreachable endpoint (cache unreachable)
+//!   -> { "key", "value", "version", "lock_name", "lock_acquired",
+//!        "lock_released", "is_leader", "leader_status", "served_by" }
+//!   -> 503 with a detail naming the unreachable endpoint (cluster unreachable)
 //! ```
 //!
-//! The handler resolves [`ClusterCacheV1`](cluster_sdk::ClusterCacheV1) from the
-//! `ClientHub` and does a `put` + `get` round-trip. Cluster's data plane is gRPC,
-//! so — unlike the REST examples in this demo — the consumer→cluster hop travels
-//! over gRPC to the cluster pod, discovered by Kubernetes DNS convention
+//! The handler exercises all three cluster primitives against the cluster pod:
+//! [`DistributedLockV1`](cluster_sdk::DistributedLockV1) (acquire + release),
+//! [`ClusterCacheV1`](cluster_sdk::ClusterCacheV1) (put + get), and
+//! [`LeaderElectionV1`](cluster_sdk::LeaderElectionV1) (join + observe + resign),
+//! all resolved from the `ClientHub`. Cluster's data plane is gRPC, so — unlike
+//! the REST examples in this demo — the consumer→cluster hop travels over gRPC to
+//! the cluster pod, discovered by Kubernetes DNS convention
 //! (`cluster.{POD_NAMESPACE}.svc.cluster.local:50051`, see
 //! `cluster_sdk::wiring`). The gear itself links no cluster code (no
 //! `deps = [cluster]`): the framework's proxy-wiring phase registers a remote

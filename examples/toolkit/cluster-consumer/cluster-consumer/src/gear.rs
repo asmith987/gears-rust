@@ -10,7 +10,7 @@ use cluster_sdk::ClusterProfile;
 use toolkit::api::OpenApiRegistry;
 use toolkit::{Gear, GearCtx, RestApiCapability};
 
-use crate::domain::CacheRoundTripService;
+use crate::domain::CoordinationService;
 use crate::rest;
 
 /// The cluster profile this consumer binds. Its [`NAME`](ClusterProfile::NAME)
@@ -62,8 +62,8 @@ impl RestApiCapability for ClusterConsumer {
         openapi: &dyn OpenApiRegistry,
     ) -> Result<Router> {
         tracing::info!("Registering cluster-consumer REST routes");
-        // The service holds the hub and resolves `ClusterCacheV1` per call.
-        let service = Arc::new(CacheRoundTripService::new(ctx.client_hub()));
+        // The service holds the hub and resolves the cluster facades per call.
+        let service = Arc::new(CoordinationService::new(ctx.client_hub()));
         Ok(rest::register_routes(router, openapi, service))
     }
 }

@@ -7,7 +7,7 @@ use axum::{Json, Router};
 use toolkit::api::operation_builder::OperationBuilder;
 use toolkit::api::OpenApiRegistry;
 
-use crate::domain::CacheRoundTripService;
+use crate::domain::CoordinationService;
 
 const API_TAG: &str = "Cluster Consumer";
 
@@ -36,16 +36,24 @@ pub struct RoundTripRequest {
     pub value: String,
 }
 
-/// Response for a successful cache round-trip.
+/// Response for a successful coordination cycle across all three primitives.
 #[derive(Debug, Clone)]
 #[toolkit_macros::api_dto(response)]
 pub struct RoundTripResponse {
-    /// The key that was written and read back.
+    /// The key that was written and read back (cache primitive).
     pub key: String,
     /// The value read back from the cache.
     pub value: String,
     /// The entry's monotonic version (`>= 1`).
     pub version: u64,
+    /// The distributed lock that was held (a non-empty name proves acquisition).
+    pub lock_name: String,
+    /// Whether the lock was explicitly released (vs. left to lapse via TTL).
+    pub lock_released: bool,
+    /// Whether this participant observed itself as leader (leader-election primitive).
+    pub is_leader: bool,
+    /// The observed leadership status (`Leader` / `Follower` / ...).
+    pub leader_status: String,
     /// The serving process (proves edge -> `OoP` pod proxying).
     pub served_by: String,
 }
@@ -60,7 +68,7 @@ pub struct RoundTripResponse {
 pub fn register_routes(
     router: Router,
     openapi: &dyn OpenApiRegistry,
-    service: Arc<CacheRoundTripService>,
+    service: Arc<CoordinationService>,
 ) -> Router {
     // GET /cluster-consumer/v1/ping — cluster-free liveness (fast, no coordination
     // call). Anonymous + exposed, so route-sync at the edge is observable without
@@ -83,12 +91,13 @@ pub fn register_routes(
 
     OperationBuilder::post("/cluster-consumer/v1/roundtrip")
         .operation_id("cluster_consumer.roundtrip")
-        .summary("Cache round-trip through the cluster gear")
+        .summary("Coordination round-trip through the cluster gear")
         .description(
-            "Writes then reads back a key via the `ClusterCacheV1` facade resolved \
-             from the ClientHub. The consumer->cluster hop travels over gRPC to the \
-             cluster pod. Returns 503 (with the underlying cluster error) when the \
-             cluster coordination plane is unreachable.",
+            "Exercises all three cluster primitives against the cluster pod over \
+             gRPC: acquires and releases a distributed lock, writes then reads back \
+             a cache key, and joins/observes/resigns a leader election. Returns 503 \
+             (with the underlying cluster error) when the coordination plane is \
+             unreachable.",
         )
         .tag(API_TAG)
         .exposed()
@@ -99,11 +108,15 @@ pub fn register_routes(
             move |Json(req): Json<RoundTripRequest>| {
                 let service = Arc::clone(&service);
                 async move {
-                    service.round_trip(req.key, req.value).await.map(|out| {
+                    service.coordinate(req.key, req.value).await.map(|out| {
                         Json(RoundTripResponse {
                             key: out.key,
                             value: out.value,
                             version: out.version,
+                            lock_name: out.lock_name,
+                            lock_released: out.lock_released,
+                            is_leader: out.is_leader,
+                            leader_status: out.leader_status,
                             served_by: out.served_by,
                         })
                     })

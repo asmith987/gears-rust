@@ -131,4 +131,4 @@ def test_cluster_consumer_grpc_seam_connectionlost(oop_cluster):
     )
     assert r.status_code == 503, f"expected 503 (cluster unreachable on loopback), got {r.status_code}: {r.text}"
     # The detail names the failure, so an operator sees the seam was exercised.
-    assert "cluster cache call failed" in r.text, r.text
+    assert "cluster coordination call failed" in r.text, r.text

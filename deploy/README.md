@@ -374,10 +374,12 @@ DirectoryService. The `cluster` pair shows OoP→OoP over **gRPC**, discovered b
   (database `cluster` on the shared Postgres), so all pods share state and the
   Service can load-balance across them consistently.
 - **`cluster-consumer`** exposes `POST /cluster-consumer/v1/roundtrip`. Its
-  handler resolves `ClusterCacheV1` from the ClientHub — a remote client the
-  framework's proxy-wiring phase built from `cluster-sdk`'s `ConsumerRegistration`
-  — and does a cache `put` + `get`. The consumer binary does **not** link the
-  cluster gear.
+  handler resolves the three cluster facades from the ClientHub — remote clients
+  the framework's proxy-wiring phase built from `cluster-sdk`'s
+  `ConsumerRegistration` — and exercises **all three primitives** in one cycle:
+  a distributed lock (`DistributedLockV1`, acquire + release), the cache
+  (`ClusterCacheV1`, put + get), and leader election (`LeaderElectionV1`, join +
+  observe + resign). The consumer binary does **not** link the cluster gear.
 
 The cluster endpoint is **not** taken from config or the directory: cluster-sdk
 derives it as `cluster.{POD_NAMESPACE}.svc.cluster.local:50051` (invariant I9 —
@@ -395,8 +397,15 @@ there is no cluster-side endpoint key). Two consequences for deployment:
 curl -s "$RESOLVE" "$BASE/cluster-consumer/v1/roundtrip" \
   -X POST -H 'Content-Type: application/json' \
   -d '{"key":"seat/12","value":"held"}'
-# => {"key":"seat/12","value":"held","version":1,"served_by":"cluster-consumer-oop (pid 1)"}
+# => {"key":"seat/12","value":"held","version":1,
+#     "lock_name":"cluster-consumer-reservation","lock_released":true,
+#     "is_leader":true,"leader_status":"Leader",
+#     "served_by":"cluster-consumer-oop (pid 1)"}
 ```
+
+> Lock/leader coordination *names* must match `[a-zA-Z0-9_-]` (no `/`), unlike
+> cache *keys*, so the demo uses a flat name and does not `.scoped()` the
+> lock/leader facades (cache scoping is fine).
 
 Platform-plane auth: cluster's grpc-hub enforces `X-ToolKit-Internal-Token` via
 `TokenReview` (its chart's `rbac.yaml` binds `system:auth-delegator`); the
