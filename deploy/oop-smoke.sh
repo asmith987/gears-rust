@@ -54,15 +54,20 @@ DO_BUILD=0
 DO_LOAD=0
 DO_DEPLOY=0
 
-# The 5 images and their generic-per-gear build args (see deploy/README.md §1).
-# Format: "<image>|<gear_package>|<gear_bin>|<config>"; empty package = platform-host.
+# The images and their generic-per-gear build args (see deploy/README.md §1).
+# Format: "<image>|<gear_package>|<gear_bin>|<config>|<features>".
+# <features> is the cargo feature list for the OoP build. Most gears need
+# "oop_module,k8s-auth"; cluster's OoP bin is unconditional (no oop_module
+# feature), so it builds with just "k8s-auth".
 GEARS=(
-  "hello|hello|hello-oop|config/oop-hello.yaml"
-  "users-info|users-info|users-info-oop|config/oop-users-info.yaml"
-  "api-contracts|cf-api-contracts|api-contracts-oop|config/oop-api-contracts.yaml"
-  "api-contracts-consumer|cf-api-contracts-consumer|api-contracts-consumer-oop|config/oop-api-contracts-consumer.yaml"
+  "hello|hello|hello-oop|config/oop-hello.yaml|oop_module,k8s-auth"
+  "users-info|users-info|users-info-oop|config/oop-users-info.yaml|oop_module,k8s-auth"
+  "api-contracts|cf-api-contracts|api-contracts-oop|config/oop-api-contracts.yaml|oop_module,k8s-auth"
+  "api-contracts-consumer|cf-api-contracts-consumer|api-contracts-consumer-oop|config/oop-api-contracts-consumer.yaml|oop_module,k8s-auth"
+  "cluster|cf-gears-cluster|cluster-oop|config/oop-cluster.yaml|k8s-auth"
+  "cluster-consumer|cluster-consumer|cluster-consumer-oop|config/oop-cluster-consumer.yaml|oop_module,k8s-auth"
 )
-ALL_IMAGES=(platform-host hello users-info api-contracts api-contracts-consumer)
+ALL_IMAGES=(platform-host hello users-info api-contracts api-contracts-consumer cluster cluster-consumer)
 
 # ── Pretty output + assertions ─────────────────────────────────────────────
 PASS=0
@@ -147,13 +152,13 @@ build_images() {
     --build-arg CARGO_FEATURES="k8s" \
     -t "$REGISTRY/platform-host:$IMAGE_TAG" .
   for spec in "${GEARS[@]}"; do
-    IFS='|' read -r img pkg bin cfg <<<"$spec"
-    log "Building $img image (pkg=$pkg bin=$bin)"
+    IFS='|' read -r img pkg bin cfg feats <<<"$spec"
+    log "Building $img image (pkg=$pkg bin=$bin feats=$feats)"
     DOCKER_BUILDKIT=1 docker build \
       -f deploy/docker/oop-gear.Dockerfile \
       --build-arg GEAR_PACKAGE="$pkg" \
       --build-arg GEAR_BIN="$bin" \
-      --build-arg GEAR_FEATURES="oop_module,k8s-auth" \
+      --build-arg GEAR_FEATURES="$feats" \
       --build-arg GEAR_CONFIG="$cfg" \
       --build-arg BUILD_PROFILE="$BUILD_PROFILE" \
       -t "$REGISTRY/$img:$IMAGE_TAG" .
@@ -180,7 +185,7 @@ deploy_stack() {
   kubectl get namespace "$NS" >/dev/null 2>&1 || kubectl create namespace "$NS"
 
   log "Building chart dependencies"
-  for c in platform-host hello users-info api-contracts api-contracts-consumer; do
+  for c in platform-host hello users-info api-contracts api-contracts-consumer cluster cluster-consumer; do
     helm dependency build "deploy/helm/$c" >/dev/null
   done
   helm dependency update deploy/helm/toolkit-platform >/dev/null
@@ -194,10 +199,10 @@ deploy_stack() {
   # Same image tag => pod template unchanged => force new pods to pick up the
   # freshly-loaded images (pullPolicy: Never).
   log "Rolling out fresh pods"
-  for d in platform-host hello users-info api-contracts api-contracts-consumer; do
+  for d in platform-host hello users-info api-contracts api-contracts-consumer cluster cluster-consumer; do
     kubectl -n "$NS" rollout restart "deploy/$d" >/dev/null
   done
-  for d in platform-host hello users-info api-contracts api-contracts-consumer; do
+  for d in platform-host hello users-info api-contracts api-contracts-consumer cluster cluster-consumer; do
     kubectl -n "$NS" rollout status "deploy/$d" --timeout=180s
   done
 }
@@ -227,6 +232,7 @@ smoke() {
   wait_route "users-info route" GET  "/users-info/v1/cities"
   wait_route "consumer route"   POST "/api-contracts-consumer/v1/charge" \
     '{"amount_cents":1,"currency":"USD","description":"warmup"}'
+  wait_route "cluster-consumer route" GET "/cluster-consumer/v1/ping"
 
   local code body
   # 1) edge healthz
@@ -265,6 +271,18 @@ smoke() {
     "${resolve[@]}" "$base/api-contracts-consumer/v1/charge")"
   assert_contains "consumer charge -> payment_id" '"payment_id"' "$body"
   assert_contains "consumer charge -> status pending" '"status":"pending"' "$body"
+
+  # 8) cluster round-trip — the consumer resolves ClusterCacheV1 from the cluster
+  #    POD over gRPC (endpoint derived by DNS convention, discovered at :50051),
+  #    writes a key then reads it back. Unlike the loopback e2e (where the k8s DNS
+  #    name does not resolve and this returns 503), in-cluster this round-trips.
+  body="$(curl -s "${resolve[@]}" "$base/cluster-consumer/v1/ping")"
+  assert_contains "cluster-consumer ping proxied (pong)" '"message":"pong"' "$body"
+  body="$(curl -s -X POST -H 'Content-Type: application/json' \
+    -d '{"key":"seat/12","value":"held"}' \
+    "${resolve[@]}" "$base/cluster-consumer/v1/roundtrip")"
+  assert_contains "cluster round-trip reads back the value" '"value":"held"' "$body"
+  assert_contains "cluster round-trip served_by is the consumer pod" 'cluster-consumer-oop' "$body"
 
   # 8) Log-level evidence of the platform-plane internals (best-effort).
   # Capture full logs into variables first, then grep: piping `kubectl logs`

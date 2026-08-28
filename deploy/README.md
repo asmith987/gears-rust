@@ -143,6 +143,28 @@ DOCKER_BUILDKIT=1 docker build \
   --build-arg GEAR_CONFIG=config/oop-api-contracts-consumer.yaml \
   --build-arg BUILD_PROFILE=dev \
   -t ghcr.io/constructorfabric/api-contracts-consumer:dev .
+
+# cluster (coordination system gear: cache / lock / leader election). Its OoP
+# binary is unconditional (no oop_module feature), so GEAR_FEATURES is just
+# k8s-auth. It serves its coordination gRPC plane on :50051.
+DOCKER_BUILDKIT=1 docker build \
+  -f deploy/docker/oop-gear.Dockerfile \
+  --build-arg GEAR_PACKAGE=cf-gears-cluster \
+  --build-arg GEAR_BIN=cluster-oop \
+  --build-arg GEAR_FEATURES="k8s-auth" \
+  --build-arg GEAR_CONFIG=config/oop-cluster.yaml \
+  --build-arg BUILD_PROFILE=dev \
+  -t ghcr.io/constructorfabric/cluster:dev .
+
+# cluster-consumer — resolves ClusterCacheV1 from the cluster pod over gRPC.
+DOCKER_BUILDKIT=1 docker build \
+  -f deploy/docker/oop-gear.Dockerfile \
+  --build-arg GEAR_PACKAGE=cluster-consumer \
+  --build-arg GEAR_BIN=cluster-consumer-oop \
+  --build-arg GEAR_FEATURES="oop_module,k8s-auth" \
+  --build-arg GEAR_CONFIG=config/oop-cluster-consumer.yaml \
+  --build-arg BUILD_PROFILE=dev \
+  -t ghcr.io/constructorfabric/cluster-consumer:dev .
 ```
 
 ## 2. Load images into the cluster
@@ -154,6 +176,8 @@ minikube image load ghcr.io/constructorfabric/hello:dev
 minikube image load ghcr.io/constructorfabric/users-info:dev
 minikube image load ghcr.io/constructorfabric/api-contracts:dev
 minikube image load ghcr.io/constructorfabric/api-contracts-consumer:dev
+minikube image load ghcr.io/constructorfabric/cluster:dev
+minikube image load ghcr.io/constructorfabric/cluster-consumer:dev
 ```
 
 > **Docker-driver gotcha:** `minikube image load <tag>` may **not** overwrite an
@@ -191,6 +215,16 @@ All external traffic enters through the api-gateway edge, exposed by the
 `platform-host.local`, class `nginx`). Enable the controller once with
 `minikube addons enable ingress`, then reach the edge without editing
 `/etc/hosts` via `curl --resolve`:
+
+> **macOS + `--driver=docker`:** `minikube ip` (e.g. `192.168.49.2`) is not
+> routable from the host, so the `--resolve` curls below (and `oop-smoke.sh`'s
+> smoke stage) will time out on `/healthz`. Either run `minikube tunnel` in a
+> separate terminal (ingress then answers at `127.0.0.1`, so use
+> `--resolve platform-host.local:80:127.0.0.1`), or skip the ingress entirely and
+> port-forward the edge:
+> `kubectl -n cf-gears port-forward svc/platform-host 8087:8087`, then
+> `curl http://127.0.0.1:8087/...`. On Linux / VM drivers the `minikube ip` path
+> works as written.
 
 ```bash
 MIP=$(minikube ip)
@@ -327,6 +361,56 @@ kubectl -n cf-gears logs deploy/api-contracts | grep '"method":"charge"'
 kubectl -n cf-gears logs deploy/api-contracts-consumer | grep 'dependency resolved'
 # => readiness: dependency resolved dep=api-contracts   (the resolving REST client)
 ```
+
+## Cluster coordination (gRPC, DNS-derived)
+
+The `api-contracts` pair above is OoP→OoP over **REST**, discovered via the
+DirectoryService. The `cluster` pair shows OoP→OoP over **gRPC**, discovered by
+**Kubernetes DNS convention** rather than the directory:
+
+- **`cluster`** (system gear) serves its coordination plane (cache / lock /
+  leader election) on a gRPC Service at **`:50051`** and registers presence with
+  the DirectoryService. `values-dev` runs **3 replicas on the `postgres` backend**
+  (database `cluster` on the shared Postgres), so all pods share state and the
+  Service can load-balance across them consistently.
+- **`cluster-consumer`** exposes `POST /cluster-consumer/v1/roundtrip`. Its
+  handler resolves `ClusterCacheV1` from the ClientHub — a remote client the
+  framework's proxy-wiring phase built from `cluster-sdk`'s `ConsumerRegistration`
+  — and does a cache `put` + `get`. The consumer binary does **not** link the
+  cluster gear.
+
+The cluster endpoint is **not** taken from config or the directory: cluster-sdk
+derives it as `cluster.{POD_NAMESPACE}.svc.cluster.local:50051` (invariant I9 —
+there is no cluster-side endpoint key). Two consequences for deployment:
+
+- The cluster chart **must** be named `cluster` (`fullnameOverride: cluster`) and
+  publish `:50051` (`grpc.enabled: true`, `grpc.port: 50051`), so the derived
+  Service DNS resolves. `POD_NAMESPACE` is injected from the downward API by the
+  `toolkit-common` deployment template, so the consumer needs no endpoint config.
+- On plain loopback (the `make e2e-oop` suite) that DNS name does not resolve, so
+  the round-trip returns a typed `503` (`ConnectionLost`) — the seam proof. Here
+  in Kubernetes it round-trips for real:
+
+```bash
+curl -s "$RESOLVE" "$BASE/cluster-consumer/v1/roundtrip" \
+  -X POST -H 'Content-Type: application/json' \
+  -d '{"key":"seat/12","value":"held"}'
+# => {"key":"seat/12","value":"held","version":1,"served_by":"cluster-consumer-oop (pid 1)"}
+```
+
+Platform-plane auth: cluster's grpc-hub enforces `X-ToolKit-Internal-Token` via
+`TokenReview` (its chart's `rbac.yaml` binds `system:auth-delegator`); the
+consumer's remote client attaches its projected SA token automatically. For a
+first light-up you can drop the grpc-hub `internal_auth` block in the cluster
+chart's `config.content` to run the coordination plane pass-through.
+
+The `postgres` backend is what makes coordination correct across the 3 replicas
+(distributed locks / leader election / cache all share state through the
+`cluster` database; the postgres-cluster-plugin runs its own migrations on
+startup). For a single-pod, infrastructure-free run, set the `demo` profile's
+`cache.provider` to `standalone` in the cluster chart's `config.content` and drop
+`replicaCount` to 1 — but note standalone is in-memory per-pod and does not
+coordinate across replicas.
 
 ## Local (no Kubernetes) end-to-end
 

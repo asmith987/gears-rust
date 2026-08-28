@@ -54,6 +54,7 @@ postgres:
     - resourcegroup
     - credstore
     - usersinfo
+    - cluster
 
 hello:
   enabled: true
@@ -96,6 +97,40 @@ api-contracts-consumer:
   fullnameOverride: api-contracts-consumer
   image:
     repository: ghcr.io/constructorfabric/api-contracts-consumer
+    tag: "dev"
+    pullPolicy: Never
+  directoryEndpoint: "http://platform-host:50051"
+
+# Cluster coordination demo: the cluster gear (standalone backend) + a consumer
+# that resolves ClusterCacheV1 from the cluster pod over gRPC. `fullnameOverride:
+# cluster` is REQUIRED — the consumer derives cluster.{namespace}.svc.cluster
+# .local:50051, so the Service must be named `cluster`.
+cluster:
+  enabled: true
+  fullnameOverride: cluster
+  # Multiple replicas coordinating through the shared Postgres — a single Service
+  # (:50051) load-balances across them, and shared state keeps reads/writes
+  # consistent regardless of which pod answers. This is the point of the postgres
+  # backend (the chart default); standalone would be per-pod and inconsistent.
+  replicaCount: 3
+  image:
+    repository: ghcr.io/constructorfabric/cluster
+    tag: "dev"
+    pullPolicy: Never
+  directoryEndpoint: "http://platform-host:50051"
+  # Backing store — the shared Postgres below, database `cluster` (added to
+  # postgres.databases). Matches the cluster chart's postgres defaults.
+  postgres:
+    host: shared-postgres
+    user: platform
+    password: "platform-demo-pw"
+    database: cluster
+
+cluster-consumer:
+  enabled: true
+  fullnameOverride: cluster-consumer
+  image:
+    repository: ghcr.io/constructorfabric/cluster-consumer
     tag: "dev"
     pullPolicy: Never
   directoryEndpoint: "http://platform-host:50051"
