@@ -23,11 +23,12 @@ const RESOURCE: &str = "33333333-3333-3333-3333-333333333333";
 struct AllowAllMock;
 
 #[async_trait]
-impl AuthZResolverClient for AllowAllMock {
+impl AuthZResolverApi for AllowAllMock {
     async fn evaluate(
         &self,
+        _ctx: SecurityContext,
         req: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
+    ) -> Result<EvaluationResponse, CanonicalError> {
         // Resolve tenant: explicit context first, then subject fallback.
         let tenant_id = req
             .context
@@ -92,11 +93,12 @@ impl DenyMock {
 }
 
 #[async_trait]
-impl AuthZResolverClient for DenyMock {
+impl AuthZResolverApi for DenyMock {
     async fn evaluate(
         &self,
+        _ctx: SecurityContext,
         _req: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
+    ) -> Result<EvaluationResponse, CanonicalError> {
         Ok(EvaluationResponse {
             decision: false,
             context: EvaluationResponseContext {
@@ -111,12 +113,13 @@ impl AuthZResolverClient for DenyMock {
 struct FailMock;
 
 #[async_trait]
-impl AuthZResolverClient for FailMock {
+impl AuthZResolverApi for FailMock {
     async fn evaluate(
         &self,
+        _ctx: SecurityContext,
         _req: EvaluationRequest,
-    ) -> Result<EvaluationResponse, AuthZResolverError> {
-        Err(AuthZResolverError::Internal("boom".to_owned()))
+    ) -> Result<EvaluationResponse, CanonicalError> {
+        Err(CanonicalError::internal("boom").create())
     }
 }
 
@@ -133,8 +136,42 @@ const TEST_RESOURCE: ResourceType = ResourceType::from_static(
     &[pep_properties::OWNER_TENANT_ID, pep_properties::RESOURCE_ID],
 );
 
-fn enforcer(mock: impl AuthZResolverClient + 'static) -> PolicyEnforcer {
+fn enforcer(mock: impl AuthZResolverApi + 'static) -> PolicyEnforcer {
     PolicyEnforcer::new(Arc::new(mock))
+}
+
+// ── from_hub (lazy resolution) ───────────────────────────────────
+
+#[tokio::test]
+async fn from_hub_resolves_registered_client() {
+    let hub = Arc::new(ClientHub::new());
+    hub.register::<dyn AuthZResolverApi>(Arc::new(AllowAllMock));
+    let e = PolicyEnforcer::from_hub(hub);
+    let ctx = test_ctx();
+
+    let scope = e
+        .access_scope(&ctx, &TEST_RESOURCE, "get", Some(uuid(RESOURCE)))
+        .await
+        .expect("lazy resolution should succeed once the client is registered");
+
+    assert_eq!(
+        scope.all_uuid_values_for(pep_properties::OWNER_TENANT_ID),
+        &[uuid(TENANT)]
+    );
+}
+
+#[tokio::test]
+async fn from_hub_errors_when_client_unregistered() {
+    let hub = Arc::new(ClientHub::new());
+    let e = PolicyEnforcer::from_hub(hub);
+    let ctx = test_ctx();
+
+    let err = e
+        .access_scope(&ctx, &TEST_RESOURCE, "get", Some(uuid(RESOURCE)))
+        .await
+        .expect_err("an unregistered client should surface a transport error");
+
+    assert!(matches!(err, EnforcerError::EvaluationFailed(_)));
 }
 
 // ── build_request ────────────────────────────────────────────────

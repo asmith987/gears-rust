@@ -4,7 +4,7 @@
 use std::sync::{Arc, OnceLock};
 
 use async_trait::async_trait;
-use authz_resolver_sdk::{AuthZResolverClient, PolicyEnforcer};
+use authz_resolver_sdk::{AuthZResolverApi, PolicyEnforcer};
 use resource_group_sdk::{ResourceGroupClient, ResourceGroupReadHierarchy};
 use sea_orm_migration::MigrationTrait;
 use toolkit::api::OpenApiRegistry;
@@ -62,7 +62,7 @@ impl Gear for ResourceGroup {
         // Resolve AuthZ client from ClientHub and create PolicyEnforcer
         let authz = ctx
             .client_hub()
-            .get::<dyn AuthZResolverClient>()
+            .get::<dyn AuthZResolverApi>()
             .map_err(|e| anyhow::anyhow!("failed to get AuthZ resolver: {e}"))?;
         let enforcer = PolicyEnforcer::new(authz);
 

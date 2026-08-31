@@ -276,7 +276,7 @@ gears-rust/
 │  ├─ system/       # Control plane (api-gateway, authn/authz, tenant, registries, oagw)
 │  └─ <service>/    # Business/domain & GenAI gears (mini-chat, file-parser, ...)
 ├─ apps/            # Executable apps composing gears (example server)
-├─ examples/        # Reference gears (users-info, oop-gears, fips-probe)
+├─ examples/        # Reference gears (users-info, api-contracts, hello, fips-probe)
 ├─ tools/           # CI scripts, fuzz targets
 └─ docs/            # Manifest, gears registry, toolkit_unified_system, arch, security
 ```
@@ -335,10 +335,10 @@ A Gear:
 The **logical model stays identical** regardless of the physical boundary.
 
 - **In-process (default)** — gears share one runtime; communicate via typed `ClientHub` clients; wired by Tookit
-- **Out-of-process** — gears as separate processes over **gRPC**
+- **Out-of-process** — gears as separate processes, reached through the same generated contract client
   - `HostRuntime` OoP orchestration hooks
   - `toolkit-transport-grpc` transport library
-  - `examples/oop-gears/` demonstrates the pattern
+  - `examples/toolkit/api-contracts/`, `examples/toolkit/hello/` demonstrate the pattern
 
 > Switch modes with a YAML field (`runtime.type`) — **no code changes**.
 

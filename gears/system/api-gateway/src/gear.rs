@@ -94,6 +94,12 @@ pub struct ApiGateway {
     // task and read by the Forwarder fallback; empty/unused when
     // `gateway_proxy` is disabled.
     pub(crate) proxy_registry: Arc<toolkit_gateway::ProxyRegistry>,
+
+    // Base URL other pods use to reach this gateway, published once the main
+    // listener binds (from `serve`). Read by the runtime's directory-register
+    // phase (via `ApiGatewayCapability::bound_endpoint`) to advertise in-process
+    // REST providers. `None` until the server binds.
+    pub(crate) bound_endpoint: Mutex<Option<String>>,
 }
 
 impl Default for ApiGateway {
@@ -110,6 +116,7 @@ impl Default for ApiGateway {
             registered_routes: DashMap::new(),
             registered_handlers: DashMap::new(),
             proxy_registry: Arc::new(toolkit_gateway::ProxyRegistry::new()),
+            bound_endpoint: Mutex::new(None),
         }
     }
 }
@@ -201,6 +208,7 @@ impl ApiGateway {
             registered_routes: DashMap::new(),
             registered_handlers: DashMap::new(),
             proxy_registry: Arc::new(toolkit_gateway::ProxyRegistry::new()),
+            bound_endpoint: Mutex::new(None),
         }
     }
 
@@ -693,7 +701,10 @@ impl ApiGateway {
 
         // Bind the main socket.
         let listener = tokio::net::TcpListener::bind(addr).await?;
-        tracing::info!("HTTP server bound on {}", addr);
+        let bound_addr = listener.local_addr().unwrap_or(addr);
+        tracing::info!("HTTP server bound on {}", bound_addr);
+
+        self.publish_bound_endpoint(&cfg, bound_addr);
 
         // Bind the separate health listener (if `serve` = separate|both) BEFORE signalling
         // ready, so readiness reflects every listener the pod must accept traffic on.
@@ -727,6 +738,43 @@ impl ApiGateway {
         } else {
             main_server.await.map_err(|e| anyhow::anyhow!(e))
         }
+    }
+
+    /// Publish the endpoint other pods use to reach this gateway, so the
+    /// runtime's directory-register phase can advertise in-process REST
+    /// providers (via `#[toolkit::provides]`). Prefers the explicitly configured
+    /// `advertise_uri` (required in Kubernetes, where the pod binds `0.0.0.0`);
+    /// otherwise falls back to the bound address plus the normalized
+    /// `prefix_path`, so the advertised base URL matches the path under which
+    /// `rest_finalize` actually serves the routes.
+    ///
+    /// A wildcard bind address (`0.0.0.0` or `::`) is not reachable by other
+    /// pods, so when `advertise_uri` is unset we refuse to publish it rather
+    /// than advertise an unusable endpoint; operators must set `advertise_uri`.
+    fn publish_bound_endpoint(&self, cfg: &ApiGatewayConfig, bound_addr: SocketAddr) {
+        let advertised = match cfg.advertise_uri.clone() {
+            Some(uri) => uri,
+            None if bound_addr.ip().is_unspecified() => {
+                tracing::warn!(
+                    bound_addr = %bound_addr,
+                    "REST host bound on a wildcard address with no `advertise_uri`; \
+                     skipping directory registration endpoint (set `advertise_uri`)"
+                );
+                return;
+            }
+            None => {
+                // The router is served under `prefix_path` (see `rest_finalize`),
+                // so the fallback base URL must include it. The prefix is already
+                // validated by `get_or_build_router` before we get here.
+                let prefix = Self::normalize_prefix_path(&cfg.prefix_path).unwrap_or_default();
+                format!("http://{bound_addr}{prefix}")
+            }
+        };
+        *self.bound_endpoint.lock() = Some(advertised.clone());
+        tracing::info!(
+            endpoint = %advertised,
+            "REST host endpoint published for directory registration"
+        );
     }
 
     /// Start the embedded-edge reverse-proxy directory-sync task in the
@@ -1015,6 +1063,10 @@ impl toolkit::Gear for ApiGateway {
 
 // REST host role: prepare/finalize the router, but do not start the server here.
 impl toolkit::contracts::ApiGatewayCapability for ApiGateway {
+    fn bound_endpoint(&self) -> Option<String> {
+        self.bound_endpoint.lock().clone()
+    }
+
     fn rest_prepare(
         &self,
         _ctx: &toolkit::context::GearCtx,
@@ -1163,6 +1215,85 @@ mod tests {
         assert_eq!(info.get("title").unwrap(), "Test API");
         assert_eq!(info.get("version").unwrap(), "1.0.0");
         assert_eq!(info.get("description").unwrap(), "Test Description");
+    }
+
+    #[test]
+    fn bound_endpoint_is_none_before_serve() {
+        use toolkit::contracts::ApiGatewayCapability;
+
+        let api = ApiGateway::new(ApiGatewayConfig::default());
+        assert_eq!(api.bound_endpoint(), None);
+    }
+
+    #[test]
+    fn publish_bound_endpoint_falls_back_to_bound_addr() {
+        use toolkit::contracts::ApiGatewayCapability;
+
+        let api = ApiGateway::new(ApiGatewayConfig::default());
+        let addr: SocketAddr = "127.0.0.1:8087".parse().unwrap();
+
+        api.publish_bound_endpoint(&ApiGatewayConfig::default(), addr);
+
+        assert_eq!(
+            api.bound_endpoint(),
+            Some("http://127.0.0.1:8087".to_owned())
+        );
+    }
+
+    #[test]
+    fn publish_bound_endpoint_prefers_advertise_uri() {
+        use toolkit::contracts::ApiGatewayCapability;
+
+        let cfg = ApiGatewayConfig {
+            advertise_uri: Some("http://platform-host:8087".to_owned()),
+            ..Default::default()
+        };
+        let api = ApiGateway::new(cfg.clone());
+        let addr: SocketAddr = "0.0.0.0:8087".parse().unwrap();
+
+        api.publish_bound_endpoint(&cfg, addr);
+
+        assert_eq!(
+            api.bound_endpoint(),
+            Some("http://platform-host:8087".to_owned())
+        );
+    }
+
+    #[test]
+    fn publish_bound_endpoint_fallback_includes_prefix_path() {
+        use toolkit::contracts::ApiGatewayCapability;
+
+        let cfg = ApiGatewayConfig {
+            prefix_path: "cf/".to_owned(), // normalizes to "/cf"
+            ..Default::default()
+        };
+        let api = ApiGateway::new(cfg.clone());
+        let addr: SocketAddr = "127.0.0.1:8087".parse().unwrap();
+
+        api.publish_bound_endpoint(&cfg, addr);
+
+        assert_eq!(
+            api.bound_endpoint(),
+            Some("http://127.0.0.1:8087/cf".to_owned())
+        );
+    }
+
+    #[test]
+    fn publish_bound_endpoint_skips_wildcard_without_advertise_uri() {
+        use toolkit::contracts::ApiGatewayCapability;
+
+        for wildcard in ["0.0.0.0:8087", "[::]:8087"] {
+            let api = ApiGateway::new(ApiGatewayConfig::default());
+            let addr: SocketAddr = wildcard.parse().unwrap();
+
+            api.publish_bound_endpoint(&ApiGatewayConfig::default(), addr);
+
+            assert_eq!(
+                api.bound_endpoint(),
+                None,
+                "wildcard {wildcard} must not publish an unusable endpoint"
+            );
+        }
     }
 
     #[test]

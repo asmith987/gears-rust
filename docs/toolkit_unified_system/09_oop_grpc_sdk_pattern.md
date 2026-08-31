@@ -29,11 +29,11 @@ pub enum RuntimeKind {
 
 ```yaml
 gears:
-  calculator:
+  hello:
     runtime:
       type: oop
       execution:
-        executable_path: "~/.cf-gears/bin/calculator-oop.exe"
+        executable_path: "~/.cf-gears/bin/hello-oop"
         args: [ ]
         working_directory: null
         environment:

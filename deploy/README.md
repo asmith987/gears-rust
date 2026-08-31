@@ -1,0 +1,504 @@
+# CF/Gears Profile 3 (Kubernetes) Deployment
+
+A thin, end-to-end deployment guide for the out-of-process (OoP) gear
+architecture. Every gear runs as its **own pod**; all external traffic enters
+through the **platform-host** edge, which discovers pods via the DirectoryService
+and reverse-proxies to them.
+
+### Pods
+
+- **platform-host** — one pod running the trust-coupled core (authz-resolver,
+  tenant-resolver, resource-group, account-management) + system gears
+  (gear-orchestrator, types-registry, credstore, **api-gateway** edge,
+  **grpc-hub** DirectoryService) + embedded authn-resolver.
+- **hello** — **anonymous** REST gear (no auth, no DB): the minimal cross-pod
+  reverse-proxy case.
+- **users-info** — **authenticated + remote-authz + Postgres**: the full OoP
+  path (authenticate the bearer locally → central authz-resolver over REST → own DB).
+- **api-contracts** / **api-contracts-consumer** — an **OoP→OoP pair**: the
+  consumer pod calls the provider pod over REST (`PaymentApi`), discovered via
+  the DirectoryService (the consumer binary does not link the provider).
+- **shared-postgres** — one PostgreSQL pod serving a **database per gear**
+  (`postgres` chart); gears never share tables — cross-gear reads go through SDK
+  contracts, not SQL.
+
+### Interactions verified
+
+| # | Interaction | Exercised by | Verified via |
+|---|-------------|--------------|--------------|
+| 1 | Anonymous edge → pod reverse-proxy | `hello` ping | `served_by` = the hello pod's pid |
+| 2 | Authenticated edge → pod (bearer forwarded) | `users-info`, `api-contracts-consumer` | `200`/`201` with `Authorization: Bearer` |
+| 3 | Tenant-plane auth: **missing token → 401** | every `.authenticated()` route | `%{http_code}` = `401` (no-token curls) |
+| 4 | PEP → PDP over REST (OoP gear → central authz-resolver) | `users-info` | `POST /authz-resolver/v1/evaluate` in platform-host logs |
+| 5 | OoP gear → shared Postgres (db-per-gear) | `users-info` | rows persisted in the gear's own database |
+| 6 | **OoP → OoP** gear-to-gear over REST (discovered) | `api-contracts-consumer` → `api-contracts` `/charge` | provider `"method":"charge"` log line |
+| 7 | Platform-plane s2s auth (K8s `TokenReview`) | every DirectoryService RPC | `platform-plane enforcement enabled`; negative: a gear without the token cannot register |
+| 8 | Gear self-registration + edge route-sync | all pods | `registering gear proxy routes` in platform-host logs |
+| 9 | Same software path with **no Kubernetes** | loopback run | [Local end-to-end](#local-no-kubernetes-end-to-end) |
+
+### Request paths
+
+```
+# 1) Anonymous (no token)
+curl :8087/hello/v1/ping ──▶ platform-host (api-gateway edge) ──▶ hello pod
+                             discovers via grpc-hub DirectoryService └▶ {"served_by":"hello-oop (pid 1)"}
+
+# 2) Authenticated + remote authz + DB
+curl -H 'Authorization: Bearer <jwt>' :8087/users-info/v1/cities
+        └▶ edge (forwards the bearer) ──▶ users-info pod
+                                            │ 1. authenticate the bearer locally
+                                            │ 2. PEP ──▶ authz-resolver REST (back to platform-host) ──▶ allow + tenant scope
+                                            │ 3. query ──▶ shared-postgres pod (usersinfo db)
+                                            └▶ {"items":[ ... ]}
+
+# 3) OoP → OoP (gear-to-gear over REST)
+curl -H 'Authorization: Bearer <jwt>' :8087/api-contracts-consumer/v1/charge
+        └▶ edge ──▶ api-contracts-consumer pod ──▶ api-contracts provider pod (REST) ──▶ {"payment_id":"...","status":"pending"}
+
+# Underlying every arrow above:
+#  • tenant-plane : a missing bearer is rejected with 401 at the edge
+#                   (static-authn accept_all maps any non-empty bearer to the platform-root tenant)
+#  • platform-plane: pods ↔ DirectoryService carry x-toolkit-internal-token, validated by K8s TokenReview
+#  • discovery     : each pod self-registers; the edge syncs its route table from grpc-hub
+```
+
+## Layout
+
+| Path | What |
+|------|------|
+| `apps/platform-host` | Platform-host binary crate (host mode). |
+| `examples/toolkit/hello/hello` | `hello` gear + `hello-oop` OoP binary (`--features oop_module`). |
+| `deploy/docker/platform-host.Dockerfile` | Platform-host image. |
+| `deploy/docker/oop-gear.Dockerfile` | Generic per-gear OoP image (parameterized by build args). |
+| `deploy/helm/toolkit-common` | Helm **library** chart (Deployment/Service/ConfigMap/SA + SA-token projection). |
+| `deploy/helm/platform-host` | Platform-host chart. |
+| `deploy/helm/hello` | `hello` OoP-gear chart. |
+| `examples/toolkit/users-info/users-info` | `users-info` gear; OoP binary `users-info-oop` is a feature-gated `[[bin]]` (`--features oop_module`) in the gear crate. |
+| `deploy/helm/users-info` | `users-info` OoP-gear chart (connects to the shared Postgres; can also bundle its own via `postgres.enabled`). |
+| `examples/toolkit/api-contracts/api-contracts` | `api-contracts` PaymentApi REST **provider**; its OoP binary (`api-contracts-oop`) is a feature-gated `[[bin]]` (`--features oop_module`) in the gear crate. |
+| `examples/toolkit/api-contracts/api-contracts-consumer` | `api-contracts-consumer`; its OoP binary (`api-contracts-consumer-oop`, feature `oop_module`) resolves `PaymentApi` from the provider **pod** over REST (OoP gear-to-gear). |
+| `deploy/helm/api-contracts` | `api-contracts` provider OoP-gear chart. |
+| `deploy/helm/api-contracts-consumer` | `api-contracts-consumer` OoP-gear chart. |
+| `deploy/helm/postgres` | Shared PostgreSQL chart — one server, a database per gear (created by an init script). |
+| `deploy/helm/toolkit-platform` | Umbrella chart (platform-host + gears) with `values-{dev,minimal,production}.yaml`. |
+
+## Prerequisites
+
+- Docker
+- `minikube` + `kubectl`
+- `helm`
+
+## 1. Build images
+
+```bash
+# Platform-host (dev profile = faster build; drop --build-arg for optimized release).
+# CARGO_FEATURES="k8s" compiles the grpc-hub inbound TokenReview validator.
+DOCKER_BUILDKIT=1 docker build \
+  -f deploy/docker/platform-host.Dockerfile \
+  --build-arg BUILD_PROFILE=dev \
+  --build-arg CARGO_FEATURES="k8s" \
+  -t ghcr.io/constructorfabric/platform-host:dev .
+
+# hello OoP gear (generic per-gear Dockerfile)
+DOCKER_BUILDKIT=1 docker build \
+  -f deploy/docker/oop-gear.Dockerfile \
+  --build-arg GEAR_PACKAGE=hello \
+  --build-arg GEAR_BIN=hello-oop \
+  --build-arg GEAR_FEATURES="oop_module,k8s-auth" \
+  --build-arg GEAR_CONFIG=config/oop-hello.yaml \
+  --build-arg BUILD_PROFILE=dev \
+  -t ghcr.io/constructorfabric/hello:dev .
+
+# users-info OoP gear (authenticated + DB). The OoP binary is a feature-gated
+# [[bin]] in the gear crate, so GEAR_PACKAGE is the gear crate and GEAR_FEATURES
+# enables oop_module (+ k8s-auth for the platform plane).
+DOCKER_BUILDKIT=1 docker build \
+  -f deploy/docker/oop-gear.Dockerfile \
+  --build-arg GEAR_PACKAGE=users-info \
+  --build-arg GEAR_BIN=users-info-oop \
+  --build-arg GEAR_FEATURES="oop_module,k8s-auth" \
+  --build-arg GEAR_CONFIG=config/oop-users-info.yaml \
+  --build-arg BUILD_PROFILE=dev \
+  -t ghcr.io/constructorfabric/users-info:dev .
+
+# api-contracts PaymentApi REST PROVIDER (authenticated, no DB). The OoP binary
+# is a feature-gated [[bin]] in the gear crate (no separate -oop crate), so
+# GEAR_PACKAGE is the gear crate and GEAR_FEATURES enables oop_module.
+DOCKER_BUILDKIT=1 docker build \
+  -f deploy/docker/oop-gear.Dockerfile \
+  --build-arg GEAR_PACKAGE=cf-api-contracts \
+  --build-arg GEAR_BIN=api-contracts-oop \
+  --build-arg GEAR_FEATURES="oop_module,k8s-auth" \
+  --build-arg GEAR_CONFIG=config/oop-api-contracts.yaml \
+  --build-arg BUILD_PROFILE=dev \
+  -t ghcr.io/constructorfabric/api-contracts:dev .
+
+# api-contracts-consumer (authenticated, no DB) — calls the provider POD over REST.
+# Also a feature-gated [[bin]] in the gear crate.
+DOCKER_BUILDKIT=1 docker build \
+  -f deploy/docker/oop-gear.Dockerfile \
+  --build-arg GEAR_PACKAGE=cf-api-contracts-consumer \
+  --build-arg GEAR_BIN=api-contracts-consumer-oop \
+  --build-arg GEAR_FEATURES="oop_module,k8s-auth" \
+  --build-arg GEAR_CONFIG=config/oop-api-contracts-consumer.yaml \
+  --build-arg BUILD_PROFILE=dev \
+  -t ghcr.io/constructorfabric/api-contracts-consumer:dev .
+
+# cluster (coordination system gear: cache / lock / leader election). Its OoP
+# binary is unconditional (no oop_module feature), so GEAR_FEATURES is just
+# k8s-auth. It serves its coordination gRPC plane on :50051.
+DOCKER_BUILDKIT=1 docker build \
+  -f deploy/docker/oop-gear.Dockerfile \
+  --build-arg GEAR_PACKAGE=cf-gears-cluster \
+  --build-arg GEAR_BIN=cluster-oop \
+  --build-arg GEAR_FEATURES="k8s-auth" \
+  --build-arg GEAR_CONFIG=config/oop-cluster.yaml \
+  --build-arg BUILD_PROFILE=dev \
+  -t ghcr.io/constructorfabric/cluster:dev .
+
+# cluster-consumer — resolves ClusterCacheV1 from the cluster pod over gRPC.
+DOCKER_BUILDKIT=1 docker build \
+  -f deploy/docker/oop-gear.Dockerfile \
+  --build-arg GEAR_PACKAGE=cluster-consumer \
+  --build-arg GEAR_BIN=cluster-consumer-oop \
+  --build-arg GEAR_FEATURES="oop_module,k8s-auth" \
+  --build-arg GEAR_CONFIG=config/oop-cluster-consumer.yaml \
+  --build-arg BUILD_PROFILE=dev \
+  -t ghcr.io/constructorfabric/cluster-consumer:dev .
+```
+
+## 2. Load images into the cluster
+
+```bash
+minikube start                    # if not already running
+minikube image load ghcr.io/constructorfabric/platform-host:dev
+minikube image load ghcr.io/constructorfabric/hello:dev
+minikube image load ghcr.io/constructorfabric/users-info:dev
+minikube image load ghcr.io/constructorfabric/api-contracts:dev
+minikube image load ghcr.io/constructorfabric/api-contracts-consumer:dev
+minikube image load ghcr.io/constructorfabric/cluster:dev
+minikube image load ghcr.io/constructorfabric/cluster-consumer:dev
+```
+
+> **Docker-driver gotcha:** `minikube image load <tag>` may **not** overwrite an
+> existing tag if a running container still references the old image (you'll see
+> the gear boot the *previous* build). If you rebuild an image, either delete the
+> gear's pod first (`kubectl -n cf-gears delete pod -l
+> app.kubernetes.io/name=<gear>`) or load via a tarball:
+> `docker save <tag> -o /tmp/img.tar && minikube image load /tmp/img.tar`, then
+> `kubectl -n cf-gears rollout restart deploy/<gear>`.
+
+## 3. Deploy
+
+```bash
+kubectl create namespace cf-gears
+minikube addons enable ingress                     # nginx controller for the edge Ingress
+helm dependency build deploy/helm/platform-host
+helm dependency build deploy/helm/hello
+helm dependency build deploy/helm/users-info
+helm dependency build deploy/helm/api-contracts
+helm dependency build deploy/helm/api-contracts-consumer
+helm dependency update deploy/helm/toolkit-platform # packages the sub-charts
+
+helm upgrade --install platform deploy/helm/toolkit-platform \
+  -n cf-gears \
+  -f deploy/helm/toolkit-platform/values-dev.yaml \
+  --timeout 240s
+
+kubectl -n cf-gears get pods
+```
+
+## 4. Smoke test (edge → OoP)
+
+All external traffic enters through the api-gateway edge, exposed by the
+`platform-host` Ingress (`values-dev.yaml` enables it at host
+`platform-host.local`, class `nginx`). Enable the controller once with
+`minikube addons enable ingress`, then reach the edge without editing
+`/etc/hosts` via `curl --resolve`:
+
+> **macOS + `--driver=docker`:** `minikube ip` (e.g. `192.168.49.2`) is not
+> routable from the host, so the manual `--resolve` curls below will hang. Either
+> run `minikube tunnel` in a separate terminal (the ingress then answers at
+> `127.0.0.1`, so use `--resolve platform-host.local:80:127.0.0.1`), or skip the
+> ingress and port-forward the edge:
+> `kubectl -n cf-gears port-forward svc/platform-host 8087:8087`, then
+> `curl http://127.0.0.1:8087/...`. **`oop-smoke.sh` handles this automatically**
+> — it probes the Ingress and falls back to a port-forward when the node IP is not
+> reachable, so `--all` passes clean on every driver.
+
+```bash
+MIP=$(minikube ip)
+BASE="http://platform-host.local"
+RESOLVE="--resolve platform-host.local:80:$MIP"
+
+curl -s $RESOLVE $BASE/healthz            # platform-host edge -> 200
+curl -s $RESOLVE $BASE/hello/v1/ping      # reverse-proxied to the hello pod
+# => {"message":"pong","served_by":"hello-oop (pid 1)"}
+
+# users-info: authenticated + remote-authz + Postgres, all through the edge.
+# static-authn accept_all maps any non-empty bearer to the platform-root tenant.
+TID=00000000-df51-5b42-9538-d2b56b7ee953
+
+curl -s -o /dev/null -w '%{http_code}\n' \
+  $RESOLVE $BASE/users-info/v1/cities                 # no token  -> 401
+
+curl -s -X POST -H 'Authorization: Bearer test-token' -H 'Content-Type: application/json' \
+  -d "{\"name\":\"Tokyo\",\"country\":\"JP\",\"tenant_id\":\"$TID\"}" \
+  $RESOLVE $BASE/users-info/v1/cities                 # -> 201 Created
+
+curl -s -H 'Authorization: Bearer test-token' \
+  $RESOLVE $BASE/users-info/v1/cities                 # -> {"items":[{"name":"Tokyo",...}]}
+```
+
+The `$RESOLVE` / `$BASE` variables set here are reused by the commands in the
+rest of this guide.
+
+For `hello`, `served_by` is the serving process — proof the request was proxied
+across pods. For `users-info`, the `201`/`200` responses prove the full OoP
+path: the edge forwarded the bearer to the `users-info` pod, which authenticated
+it locally, called the central `authz-resolver` **over REST** for the PEP
+decision (visible as `POST /authz-resolver/v1/evaluate` in the platform-host
+logs, sourced from the users-info pod IP), and persisted to its own Postgres.
+
+### Full smoke test
+
+With the demo gears enabled (`values-dev.yaml`), the edge reverse-proxies every
+authenticated route that is marked `.exposed()`:
+
+```bash
+# Anonymous
+curl $RESOLVE $BASE/hello/v1/ping
+
+# Authenticated (static-authn accept_all maps any non-empty bearer to the
+# platform-root tenant)
+TOKEN='Authorization: Bearer test-token'
+
+curl -H "$TOKEN" $RESOLVE $BASE/users-info/v1/users
+
+# And the no-token variant should be 401:
+curl -s -o /dev/null -w '%{http_code}\n' $RESOLVE $BASE/users-info/v1/users
+```
+
+## Platform-plane auth (TokenReview)
+
+The two-plane model separates **tenant-plane** auth (end-user `Authorization:
+Bearer` → `SecurityContext`, authenticated at each gear) from **platform-plane**
+auth (service-to-service, `x-toolkit-internal-token`). This deployment enforces
+the platform plane end-to-end using Kubernetes `TokenReview`.
+
+**How it works**
+
+- Each pod (platform-host + every OoP gear) mounts a **projected ServiceAccount
+  token** with audience `toolkit-internal` at
+  `/var/run/secrets/tokens/toolkit-internal/token` (`saToken.enabled` in the
+  charts).
+- Every gRPC **caller** of the DirectoryService attaches that token:
+  - OoP gears via `oop_http.internal_auth: { provider: kube, token_path: ... }`.
+  - the edge api-gateway proxy via `gateway_proxy.internal_auth`.
+- The DirectoryService **receiver** (grpc-hub, in platform-host) validates every
+  non-exempt RPC via the K8s `TokenReview` API:
+  `grpc-hub.internal_auth: { provider: kube, audiences: [toolkit-internal] }`
+  with `internal_auth_enforcement: required`. Health + reflection RPCs are exempt.
+- `templates/rbac.yaml` in the platform-host chart binds its ServiceAccount to
+  the built-in `system:auth-delegator` ClusterRole so it may submit
+  TokenReviews. The `k8s` / `k8s-auth` cargo features compile the TokenReview
+  code path (see [Build images](#1-build-images)).
+
+**Verify enforcement**
+
+```bash
+# Positive: platform-host logs enforcement + accepted registrations.
+kubectl -n cf-gears logs deploy/platform-host | grep "platform-plane enforcement enabled"
+kubectl -n cf-gears logs deploy/platform-host | grep "registering gear proxy routes"
+
+# Negative: a caller without a valid token is rejected. Temporarily remove a
+# gear's oop_http.internal_auth (e.g. users-info) and redeploy; the gear
+# cannot register and stays NotReady:
+kubectl -n cf-gears logs deploy/users-info | grep "Unauthenticated"
+# => "directory register_instance failed: gRPC Unauthenticated: missing internal token"
+```
+
+> The local loopback path below runs Profile-1-style (no projected tokens); it
+> leaves `internal_auth` unset, so grpc-hub runs the pass-through layer. Use the
+> `shared_secret` provider to exercise the platform plane without Kubernetes.
+
+## OoP gear-to-gear (REST)
+
+The `hello` and `users-info` paths above show OoP→**host** calls (users-info
+resolves the in-host `authz-resolver` over REST). The `api-contracts` pair shows
+OoP→**OoP** — one gear pod calling another gear pod over REST, discovered via the
+DirectoryService:
+
+- **`api-contracts`** (provider pod) serves the `PaymentApi` REST contract at
+  `/api-contracts/v1/...` and registers its endpoint in the DirectoryService.
+- **`api-contracts-consumer`** (consumer pod) exposes
+  `POST /api-contracts-consumer/v1/charge`. Its handler resolves `dyn PaymentApi`
+  from the ClientHub — wired by `#[toolkit::consumes(contract = PaymentApi, from
+  = "api-contracts")]` to a **directory-resolving REST client** — and forwards
+  the charge. The consumer binary does **not** link the provider, so the call can
+  only travel over REST to the provider pod.
+
+The consumer's `/charge` route is `.exposed()`, so a single request through the
+edge exercises the whole chain — **ingress → api-gateway → consumer pod →
+provider pod** (the consumer→provider hop travels OoP→OoP over REST):
+
+```bash
+curl -s -o /dev/null -w '%{http_code}\n' \
+  -X POST -H 'Content-Type: application/json' \
+  -d '{"amount_cents":1000,"currency":"USD","description":"test"}' \
+  $RESOLVE $BASE/api-contracts-consumer/v1/charge          # no token -> 401
+
+curl -s -X POST -H 'Authorization: Bearer test-token' -H 'Content-Type: application/json' \
+  -d '{"amount_cents":1000,"currency":"USD","description":"test charge"}' \
+  $RESOLVE $BASE/api-contracts-consumer/v1/charge          # -> {"payment_id":"...","status":"pending"}
+```
+
+Confirm the hop crossed pods (the provider actually executed the charge):
+
+```bash
+kubectl -n cf-gears logs deploy/api-contracts | grep '"method":"charge"'
+# => "contract call started" / "contract call succeeded" service=PaymentApi method=charge
+kubectl -n cf-gears logs deploy/api-contracts-consumer | grep 'dependency resolved'
+# => readiness: dependency resolved dep=api-contracts   (the resolving REST client)
+```
+
+## Cluster coordination (gRPC, DNS-derived)
+
+The `api-contracts` pair above is OoP→OoP over **REST**, discovered via the
+DirectoryService. The `cluster` pair shows OoP→OoP over **gRPC**, discovered by
+**Kubernetes DNS convention** rather than the directory:
+
+- **`cluster`** (system gear) serves its coordination plane (cache / lock /
+  leader election) on a gRPC Service at **`:50051`** and registers presence with
+  the DirectoryService. `values-dev` runs **3 replicas on the `postgres` backend**
+  (database `cluster` on the shared Postgres), so all pods share state and the
+  Service can load-balance across them consistently.
+- **`cluster-consumer`** is a small **seat-reservation service** exposing
+  `reservations` / `inventory` / `status` routes (see its crate docs). It resolves
+  the three cluster facades from the ClientHub — remote clients the framework's
+  proxy-wiring phase built from `cluster-sdk`'s `ConsumerRegistration` — and uses
+  **all three primitives** the way ADR-002 intends: every seat transition is a
+  versioned `ClusterCacheV1::compare_and_swap` (the correctness gate), a per-seat
+  `DistributedLockV1::try_lock` damps contention (no remote I/O held), and a
+  `LeaderElectionV1` background sweeper (one pod at a time) reclaims expired
+  holds. The consumer binary does **not** link the cluster gear.
+
+The cluster endpoint is **not** taken from config or the directory: cluster-sdk
+derives it as `cluster.{POD_NAMESPACE}.svc.cluster.local:50051` (invariant I9 —
+there is no cluster-side endpoint key). Two consequences for deployment:
+
+- The cluster chart **must** be named `cluster` (`fullnameOverride: cluster`) and
+  publish `:50051` (`grpc.enabled: true`, `grpc.port: 50051`), so the derived
+  Service DNS resolves. `POD_NAMESPACE` is injected from the downward API by the
+  `toolkit-common` deployment template, so the consumer needs no endpoint config.
+- On plain loopback (the `make e2e-oop` suite) that DNS name does not resolve, so
+  a coordination call returns a typed `503` (`ConnectionLost`) — the seam proof.
+  Here in Kubernetes it succeeds for real:
+
+```bash
+curl -s "$RESOLVE" "$BASE/cluster-consumer/v1/reservations" \
+  -X POST -H 'Content-Type: application/json' \
+  -d '{"seat":"A12","holder":"alice"}'
+# => {"seat":"A12","status":"held","holder":"alice","expires_at_ms":...,
+#     "version":1,"served_by":"cluster-consumer-oop (pid 1)"}
+
+curl -s "$RESOLVE" "$BASE/cluster-consumer/v1/inventory"
+# => {"total":36,"available":35,"held":1,"booked":0,
+#     "available_seats":["A1","A2",...],"served_by":"cluster-consumer-oop (pid 1)"}
+```
+
+> All three primitives are `.scoped("cluster-consumer")`, so the cache key, lock,
+> and election share one namespace — the lock/election wire name composes as
+> `cluster-consumer/reservation`. A leaf name is slash-free (`[a-zA-Z0-9_-]`); the
+> server validates the composed, `/`-separated name with `validate_scoped_cluster_name`.
+
+Platform-plane auth: cluster's grpc-hub enforces `X-ToolKit-Internal-Token` via
+`TokenReview` (its chart's `rbac.yaml` binds `system:auth-delegator`); the
+consumer's remote client attaches its projected SA token automatically. For a
+first light-up you can drop the grpc-hub `internal_auth` block in the cluster
+chart's `config.content` to run the coordination plane pass-through.
+
+The `postgres` backend is what makes coordination correct across the 3 replicas
+(distributed locks / leader election / cache all share state through the
+`cluster` database; the postgres-cluster-plugin runs its own migrations on
+startup). For a single-pod, infrastructure-free run, set the `demo` profile's
+`cache.provider` to `standalone` in the cluster chart's `config.content` and drop
+`replicaCount` to 1 — but note standalone is in-memory per-pod and does not
+coordinate across replicas.
+
+## Local (no Kubernetes) end-to-end
+
+Two processes on loopback, same software path:
+
+```bash
+# Terminal 1 — platform-host (edge + DirectoryService on TCP :50051)
+cargo run -p cf-gears-platform-host -- --config config/oop-host.yaml run
+
+# Terminal 2 — hello OoP gear
+TOOLKIT_DIRECTORY_ENDPOINT=http://127.0.0.1:50051 \
+  cargo run -p hello --features oop_module --bin hello-oop -- --config config/oop-hello.yaml
+
+# Terminal 2b (optional) — users-info OoP gear (authenticated + DB).
+# The local config uses per-pod SQLite (no Postgres needed on loopback);
+# in Kubernetes the chart points it at a Postgres pod instead.
+TOOLKIT_DIRECTORY_ENDPOINT=http://127.0.0.1:50051 \
+  cargo run -p users-info --features oop_module --bin users-info-oop -- --config config/oop-users-info.yaml
+
+# Terminal 3 — through the local edge (platform-host binds :8087)
+curl http://127.0.0.1:8087/hello/v1/ping
+
+curl -H 'Authorization: Bearer test-token' http://127.0.0.1:8087/users-info/v1/cities
+```
+
+## Helm presets
+
+| Values file | Contents |
+|-------------|----------|
+| `values-dev.yaml` | platform-host + shared Postgres + 4 OoP gears (`hello`, `users-info`, `api-contracts`, `api-contracts-consumer`), `pullPolicy: Never` for locally-built images (Postgres uses the public image). Enables the `platform-host` Ingress (`platform-host.local`, class `nginx`). |
+| `values-minimal.yaml` | platform-host only (no OoP gears). |
+| `values-production.yaml` | Scaffold for a registry-pulled prod stack (hardening TODO). Enables the `platform-host` Ingress with a placeholder host + TLS block to fill in. |
+
+Only the `platform-host` chart defines an Ingress; OoP gears are reached through
+its api-gateway by path prefix (ADR-0007).
+
+## Adding another OoP gear
+
+1. Give the gear an OoP binary — a feature-gated `[[bin]]` in the gear crate
+   (`src/main.rs` + `src/registered_gears.rs`) behind an `oop_module` feature
+   that enables `toolkit/bootstrap`, calling `run_oop_with_options`. This is how
+   every OoP gear here is shaped (`hello`, `users-info`, `api-contracts`, ...):
+   - **anonymous, no deps** (like `hello`): `oop_module = ["dep:tokio",
+     "toolkit/bootstrap"]`.
+   - **authenticated / with dependencies** (like `users-info`): make the
+     embedded tenant-plane authn stack (`authn-resolver` + `static-authn-plugin`
+     + `types-registry`) **optional** deps and gate them behind `oop_module`, so
+     the library build stays slim. `registered_gears.rs` links them with
+     `use <crate> as _;`.
+2. Build its image via `deploy/docker/oop-gear.Dockerfile` (`GEAR_PACKAGE` = the
+   gear crate, `GEAR_BIN` = the OoP bin, `GEAR_FEATURES="oop_module,k8s-auth"`).
+3. Copy `deploy/helm/hello` (or `deploy/helm/users-info` if it needs a DB) as a
+   template, adjust `service.port`, `config.content` (`oop_http.advertise_uri` +
+   `gears.<name>` + any `database` block), and the image.
+4. Add it to the `toolkit-platform` umbrella `Chart.yaml` dependencies + values.
+
+**If the gear needs a database**, don't bundle its own Postgres — reuse the
+shared server: add the gear's database name to `postgres.databases` in the
+umbrella values, and set the gear's `postgres` block to `enabled: false`,
+`host: shared-postgres`, `database: <its-db>`, `user/password: platform/...`.
+The gear owns that database exclusively; it must not read another gear's tables
+(use SDK contracts for cross-gear data). See the database-topology guidance in
+`docs/arch/database/ADR/0001-cpt-cf-database-adr-object-namespacing.md`.
+
+**Authenticated gears that call the central authz-resolver** additionally need:
+the gear must `#[toolkit::consumes(contract = ..., from = "authz-resolver")]` and
+resolve the client lazily (e.g. `PolicyEnforcer::from_hub`), and the
+platform-host's api-gateway must set `advertise_uri` to its Service DNS so its
+in-process REST providers (authz-resolver) are resolvable cross-pod.
+
+## Cleanup
+
+```bash
+helm -n cf-gears uninstall platform
+kubectl delete namespace cf-gears
+# minikube stop   # or: minikube delete
+```

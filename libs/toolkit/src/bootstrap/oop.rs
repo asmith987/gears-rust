@@ -7,7 +7,9 @@
 //!
 //! - Configuration loading using `toolkit-bootstrap`
 //! - Logging initialization with tracing
-//! - gRPC connection to `DirectoryService`
+//! - Lazy gRPC client to the `DirectoryService` (connects on first use, so a
+//!   cold `DirectoryService` never blocks or crashes bootstrap —
+//!   `cpt-cf-adr-eventual-readiness`)
 //! - Gear instance registration
 //! - Heartbeat management
 //! - Gear lifecycle execution
@@ -352,8 +354,9 @@ fn merge_json_objects(target: &mut serde_json::Value, source: &serde_json::Value
 /// 1. Creates a root `CancellationToken` for the process
 /// 2. Hooks OS signals (SIGTERM, SIGINT, Ctrl+C) to trigger cancellation
 /// 3. Loads configuration and initializes logging
-/// 4. Connects to the `DirectoryService`
-/// 5. Registers the gear instance
+/// 4. Creates a lazy `DirectoryService` client (connects on first use, not at
+///    bootstrap — `cpt-cf-adr-eventual-readiness`)
+/// 5. Registers the gear instance (background presence loop, with backoff)
 /// 6. Starts a background heartbeat loop (using a child token)
 /// 7. Runs the gear lifecycle with `ShutdownOptions::Token`
 /// 8. Deregisters from `DirectoryService` on shutdown
@@ -534,11 +537,21 @@ pub async fn run_oop_with_options(opts: OopRunOptions) -> Result<()> {
         return Ok(());
     }
 
-    // Connect to DirectoryService. When the gear configures a platform-plane
-    // credential, attach it (as `x-toolkit-internal-token`) to every outbound
-    // system call via an InternalAuthInterceptor (`cpt-cf-adr-two-plane-auth`).
+    // Create the DirectoryService client with a LAZY channel. Per
+    // `cpt-cf-adr-eventual-readiness`, an OoP gear must start immediately and
+    // unconditionally even when the DirectoryService is not yet reachable —
+    // blocking (or crashing) on it at bootstrap would make it a hard startup
+    // dependency (the SPOF the ADR rejects). A lazy channel performs no eager
+    // connection: it fails fast only on a malformed endpoint, and defers the
+    // actual connect to the first RPC, where the background presence loop's
+    // exponential backoff (100ms -> 30s, forever) absorbs the startup window
+    // instead of the process exiting and relying on k8s CrashLoopBackOff.
+    //
+    // When the gear configures a platform-plane credential, attach it (as
+    // `x-toolkit-internal-token`) to every outbound system call via an
+    // InternalAuthInterceptor (`cpt-cf-adr-two-plane-auth`).
     info!(
-        "Connecting to directory service at {}",
+        "Creating directory service client (lazy connect) for {}",
         opts.directory_endpoint
     );
     let internal_auth_cfg = final_config
@@ -552,19 +565,20 @@ pub async fn run_oop_with_options(opts: OopRunOptions) -> Result<()> {
     let (directory_client, internal_token_provider) = if let Some(cfg) = internal_auth_cfg {
         let (interceptor, provider) = build_platform_credentials(cfg, &cancel).await?;
         info!("Attaching platform-plane credential to outbound DirectoryService calls");
-        let client =
-            DirectoryGrpcClient::connect_with_interceptor(&opts.directory_endpoint, interceptor)
-                .await?;
+        let client = DirectoryGrpcClient::connect_lazy_with_interceptor(
+            &opts.directory_endpoint,
+            interceptor,
+        )?;
         (client, provider)
     } else {
         (
-            DirectoryGrpcClient::connect(&opts.directory_endpoint).await?,
+            DirectoryGrpcClient::connect_lazy(&opts.directory_endpoint)?,
             None,
         )
     };
     let directory_api: Arc<dyn DirectoryClient> = Arc::new(directory_client);
 
-    info!("Successfully connected to directory service");
+    info!("Directory service client ready (will connect on first use)");
 
     // Capture OoP HTTP config (if any) before moving the config into the provider.
     let oop_http = final_config.oop_http.clone();
