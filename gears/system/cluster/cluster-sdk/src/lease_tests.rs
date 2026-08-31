@@ -289,10 +289,17 @@ async fn the_production_clock_ignores_virtual_time_but_the_test_clock_tracks_it(
     );
 
     // The injected virtual clock still fast-forwards, so TTL scenarios keep lapsing.
+    // `test_after` resolves to exactly `anchor_wall_ms + 3_600_000`, but `test_before`
+    // is sampled just after the anchor, so if the wall clock crosses a millisecond
+    // boundary in between, the observed delta undershoots the hour by up to that drift
+    // (a couple ms in practice). Assert it advanced by ~1h with the same wall-sampling
+    // tolerance the production-clock check above uses, rather than an exact bound that
+    // is flaky by construction.
     let test_after = test.now_millis();
+    let test_advanced = test_after.saturating_sub(test_before);
     assert!(
-        test_after >= test_before + 3_600_000,
-        "the injected virtual clock must still track `advance` ({test_before} -> \
-         {test_after})"
+        test_advanced.abs_diff(3_600_000) < 1_000,
+        "the injected virtual clock must still track `advance` (~1h, got \
+         {test_advanced}ms): {test_before} -> {test_after}"
     );
 }
