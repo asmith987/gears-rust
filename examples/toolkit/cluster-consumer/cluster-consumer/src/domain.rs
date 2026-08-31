@@ -8,9 +8,17 @@
 //! [`seed_roster`](ReservationService::seed_roster) /
 //! [`sweep_expired`](ReservationService::sweep_expired) methods here.
 //!
-//! Facades are resolved from the [`ClientHub`] **per call**, so the service holds
-//! only an `Arc<ClientHub>` and is oblivious to whether the cluster gear is
-//! co-located (Profile 1) or a remote gRPC proxy (Profile 3).
+//! Each facade is resolved from the [`ClientHub`] **once, lazily** on first use
+//! and then memoized in a [`OnceCell`](tokio::sync::OnceCell): resolution redoes
+//! in-process bookkeeping (the requirement registry recording, name/scope
+//! validation, `Arc` allocation) on every call, and the descriptor it awaits is
+//! cached on the client after the first fetch — so re-resolving per request is
+//! pure churn on a hot path. The facade is a cheap cloneable `Arc` handle built
+//! for exactly this. Memoizing does not couple the service to a deployment mode:
+//! Profile 1 (co-located) vs Profile 3 (remote gRPC proxy) is decided at *client
+//! registration*, not per resolve, so the cached handle is as mode-oblivious as a
+//! freshly resolved one. Only a successful bind is cached (`get_or_try_init`), so
+//! a transient warmup failure retries rather than pinning a broken facade.
 
 use std::collections::HashSet;
 use std::sync::Arc;
@@ -18,6 +26,7 @@ use std::time::Duration;
 
 use cluster_sdk::cache::{CacheEntry, PutRequest, Ttl};
 use cluster_sdk::{ClusterCacheV1, ClusterError, DistributedLockV1, LeaderElectionV1, LockGuard};
+use tokio::sync::OnceCell;
 use toolkit::ClientHub;
 
 use crate::error::ReservationError;
@@ -106,18 +115,30 @@ pub struct InventorySummary {
     pub available_seats: Vec<String>,
 }
 
-/// Resolves the cluster facades per call and runs the reservation domain logic.
+/// Resolves the cluster facades once (memoized) and runs the reservation domain
+/// logic. Each `OnceCell` holds the already-[`scoped`](ClusterCacheV1::scoped)
+/// facade for its primitive, populated on first use.
 pub struct ReservationService {
     hub: Arc<ClientHub>,
     node: Arc<NodeState>,
+    cache: OnceCell<ClusterCacheV1>,
+    locks: OnceCell<DistributedLockV1>,
+    leader: OnceCell<LeaderElectionV1>,
 }
 
 impl ReservationService {
     /// Build over a `ClientHub` handle (typically `ctx.client_hub()`) and the
-    /// shared node state the sweeper updates and `/status` reports.
+    /// shared node state the sweeper updates and `/status` reports. The facade
+    /// cells start empty and fill on first resolve.
     #[must_use]
     pub fn new(hub: Arc<ClientHub>, node: Arc<NodeState>) -> Self {
-        Self { hub, node }
+        Self {
+            hub,
+            node,
+            cache: OnceCell::new(),
+            locks: OnceCell::new(),
+            leader: OnceCell::new(),
+        }
     }
 
     /// The shared leader/sweeper status this pod reports on `/status`.
@@ -126,42 +147,61 @@ impl ReservationService {
         &self.node
     }
 
-    // --- facade resolution (per call, binding-mode-agnostic) ----------------
+    // --- facade resolution (memoized, binding-mode-agnostic) ----------------
+    //
+    // Each helper resolves its scoped facade at most once via `get_or_try_init`
+    // and returns a cheap `Arc`-handle clone thereafter. Only a successful bind is
+    // stored, so a transient failure during warmup retries on the next call.
 
     async fn cache(&self) -> Result<ClusterCacheV1, ReservationError> {
-        ClusterCacheV1::resolver(&self.hub)
-            .profile(DemoProfile)
-            .resolve()
+        self.cache
+            .get_or_try_init(|| async {
+                ClusterCacheV1::resolver(&self.hub)
+                    .profile(DemoProfile)
+                    .resolve()
+                    .await
+                    .map_err(ReservationError::unavailable)?
+                    .scoped(SCOPE)
+                    .map_err(ReservationError::unavailable)
+            })
             .await
-            .map_err(ReservationError::unavailable)?
-            .scoped(SCOPE)
-            .map_err(ReservationError::unavailable)
+            .cloned()
     }
 
     async fn locks(&self) -> Result<DistributedLockV1, ReservationError> {
-        DistributedLockV1::resolver(&self.hub)
-            .profile(DemoProfile)
-            .resolve()
+        self.locks
+            .get_or_try_init(|| async {
+                DistributedLockV1::resolver(&self.hub)
+                    .profile(DemoProfile)
+                    .resolve()
+                    .await
+                    .map_err(ReservationError::unavailable)?
+                    .scoped(SCOPE)
+                    .map_err(ReservationError::unavailable)
+            })
             .await
-            .map_err(ReservationError::unavailable)?
-            .scoped(SCOPE)
-            .map_err(ReservationError::unavailable)
+            .cloned()
     }
 
     /// The scoped leader-election facade — used by [`crate::sweeper`] to campaign
-    /// for the singleton maintenance role.
+    /// for the singleton maintenance role. Resolved once, then memoized.
     ///
     /// # Errors
     /// [`ReservationError::ClusterUnavailable`] if the cluster cannot be resolved
     /// or reached.
     pub async fn leader(&self) -> Result<LeaderElectionV1, ReservationError> {
-        LeaderElectionV1::resolver(&self.hub)
-            .profile(DemoProfile)
-            .resolve()
+        self.leader
+            .get_or_try_init(|| async {
+                LeaderElectionV1::resolver(&self.hub)
+                    .profile(DemoProfile)
+                    .resolve()
+                    .await
+                    .map_err(ReservationError::unavailable)?
+                    .scoped(SCOPE)
+                    .map_err(ReservationError::unavailable)
+            })
             .await
-            .map_err(ReservationError::unavailable)?
-            .scoped(SCOPE)
-            .map_err(ReservationError::unavailable)
+            .cloned()
     }
 
     // --- request-path operations --------------------------------------------
